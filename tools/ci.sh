@@ -10,7 +10,7 @@ idf.py -B build -D SDKCONFIG="$sdkconfig_path" build
 
 for script in tools/*_host.sh; do
     echo "==> $script"
-    sh "$script"
+    bash "$script"
 done
 
 node tools/test_web_gateway_page.mjs
