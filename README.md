@@ -5,7 +5,7 @@
 
 基于 ESP-IDF 的实验性无线 CarPlay 接收与网页中转项目。协议实现参考 [DiPlay / xcertplay](https://github.com/shihabal3amri/DiPlay)，浏览器媒体和触控路径参考 [WheelPlay](https://github.com/fython/wheelplay)。
 
-> **项目状态：**M2 浏览器样机及 M3–M5 协议代码持续完善中；ESP-IDF 5.5.3 的经典 ESP32 固件已构建通过。项目尚未在 ESP32 开发板、iPhone 和目标车机浏览器上完成端到端实测，当前代码不代表已成功建立真实 CarPlay 连接。
+> **项目状态：** M2 浏览器样机及 M3–M5 协议代码持续完善中；ESP-IDF 5.5.3 的经典 ESP32 固件已构建通过。项目尚未在 ESP32 开发板、iPhone 和目标车机浏览器上完成端到端实测，当前代码不代表已成功建立真实 CarPlay 连接。
 
 ## 工作流程
 
