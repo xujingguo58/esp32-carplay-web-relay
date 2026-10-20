@@ -1,0 +1,57 @@
+menu "CarPlay Relay"
+
+    menu "SoftAP"
+
+        config CARPLAY_AP_SSID
+            string "Access point SSID"
+            default "ESP32-CarPlay"
+            help
+                SSID advertised by the ESP32 SoftAP. Maximum length is 32 bytes.
+
+        config CARPLAY_AP_PASSWORD
+            string "Access point WPA2 password"
+            default ""
+            help
+                WPA2-PSK password. Set a value between 8 and 63 characters.
+                The password is intentionally empty by default and must not be
+                committed in sdkconfig or shared in source control.
+
+        config CARPLAY_AP_CHANNEL
+            int "Access point channel"
+            range 1 13
+            default 6
+            help
+                2.4 GHz channel used by the SoftAP.
+
+        config CARPLAY_AP_MAX_STA
+            int "Maximum SoftAP clients"
+            range 2 8
+            default 2
+            help
+                The MVP needs one iPhone and one head-unit browser client.
+
+    endmenu
+
+    menu "WebRTC test media"
+
+        config CARPLAY_WEBRTC_TEST_STREAM
+            bool "Send an embedded synthetic H.264 test stream"
+            default y
+            help
+                Development-only M2 stream. Disable when forwarding a real
+                CarPlay video source.
+
+    endmenu
+
+    menu "AirPlay receiver"
+
+        config AIRPLAY_PAIRING_CODE
+            string "AirPlay Pair-Setup code"
+            default "3939"
+            help
+                Development Pair-Setup code used by the software AirPlay identity.
+                Change this before testing on a shared network.
+
+    endmenu
+
+endmenu

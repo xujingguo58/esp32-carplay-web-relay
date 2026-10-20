@@ -1,0 +1,31 @@
+idf_component_register(
+    SRCS "app_main.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        app_update
+        airplay_screen
+        airplay_media_bridge
+        airplay_pairing
+        airplay_pairing_store
+        airplay_rtsp
+        airplay_session
+        airplay_identity_port
+        airplay_software_provider
+        esp_common
+        esp_app_format
+        esp_wifi
+        bt_port
+        auth_port
+        auth_software_provider
+        freertos
+        iap2_core
+        iap2_carplay
+        iap2_identity
+        iap2_mfi_auth
+        log
+        mdns
+        net_port
+        nvs_flash
+        web_gateway
+        time_port
+)

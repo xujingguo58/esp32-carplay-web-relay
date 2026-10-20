@@ -1,0 +1,9 @@
+build/
+build-4mb/
+build-8mb/
+sdkconfig
+sdkconfig.4mb
+sdkconfig.8mb
+sdkconfig.old
+managed_components/
+.DS_Store

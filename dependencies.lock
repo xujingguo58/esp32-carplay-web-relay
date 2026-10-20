@@ -1,0 +1,39 @@
+dependencies:
+  espressif/esp_libsrtp:
+    component_hash: 131560184c73ec09f77d8904a2db709307803f0f9f111898921b6966776eac15
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.0.0
+  espressif/esp_peer:
+    component_hash: 92bc1b80772acf8a0e2dc36193ec24278e0793140eca2a4060d8ce7b45c47845
+    dependencies:
+    - name: espressif/esp_libsrtp
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1.0.0
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.5.7
+  espressif/mdns:
+    component_hash: d36b265164be5139f92de993f08f5ecaa0de0c0acbf84deee1f10bb5902d04ff
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.4.3
+  idf:
+    source:
+      type: idf
+    version: 5.5.3
+direct_dependencies:
+- espressif/esp_peer
+- espressif/mdns
+manifest_hash: df623cfe1305c950443d314cb50c79c3b9bb0b994f64b463ea68d92a972ff75c
+target: esp32
+version: 2.0.0
