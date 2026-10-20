@@ -1,0 +1,30 @@
+name: ESP-IDF CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  esp32:
+    name: ESP32 build and host checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Build and run host checks with ESP-IDF 5.5.3
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.3
+          target: esp32
+          command: >-
+            apt-get update &&
+            apt-get install --yes clang nodejs &&
+            sh tools/ci.sh

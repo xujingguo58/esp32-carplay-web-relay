@@ -16,8 +16,13 @@ cmake -S "$IDF_PATH/components/mbedtls/mbedtls" -B "$tmp_build/mbedtls" \
 cmake --build "$tmp_build/mbedtls" --target mbedcrypto --parallel 4
 
 compiler=${CC:-clang}
+case "$(uname -s)" in
+    Darwin) linker_gc_flag="-Wl,-dead_strip" ;;
+    *) linker_gc_flag="-Wl,--gc-sections" ;;
+esac
+
 "$compiler" -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
-    -ffunction-sections -fdata-sections -Wl,-dead_strip \
+    -ffunction-sections -fdata-sections "$linker_gc_flag" \
     -DCONFIG_MBEDTLS_CHACHAPOLY_C=1 -DCONFIG_MBEDTLS_HKDF_C=1 \
     -I"$repo_root/tools/test_support/airplay_screen_host_stubs" \
     -I"$repo_root/build/config" \

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Project status and planned work
+    url: https://github.com/xujingguo58/esp32-carplay-web-relay/blob/main/docs/ROADMAP.md
+    about: Check the current milestone status and known hardware-validation gaps.
+  - name: Private security report
+    url: https://github.com/xujingguo58/esp32-carplay-web-relay/security
+    about: Read the security policy and check the available private reporting channel.

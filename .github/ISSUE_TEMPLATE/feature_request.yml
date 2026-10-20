@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest a feature or project improvement.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do, and what is missing?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the behavior you would like.
+    validations:
+      required: true
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Constraints and tradeoffs
+      description: Mention protocol, memory, hardware, compatibility, or licensing constraints you know about.

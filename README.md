@@ -1,5 +1,8 @@
 # ESP32 CarPlay Web Relay
 
+[![ESP-IDF CI](https://github.com/xujingguo58/esp32-carplay-web-relay/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/xujingguo58/esp32-carplay-web-relay/actions/workflows/ci.yml)
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+
 参考 DiPlay / xcertplay 的 CarPlay 接收流程和 WheelPlay 的浏览器显示方式，在 ESP-IDF 上构建运行于 ESP32 的无线 CarPlay 接收与网页中转工程。
 
 > **项目状态：M2 样机代码已落地，M3–M5 仍在开发。** ESP-IDF 5.5.3 / 经典 `esp32` 已有通过构建的 8 MB Flash profile。默认软件 MFi challenge signer 与 AirPlay Pair-Setup/Pair-Verify identity provider 已接入；AirPlay Ed25519 身份首次启动时生成并写入 NVS，`/info` 声明 800×480 触控屏。主机协议测试和 provider 构建通过，但尚未在开发板、iPhone 或车机浏览器上验证热点/蓝牙共存、真实 CarPlay 会话、视频播放与 HID 控制。MFi challenge-response 不要求外置 MFi 芯片。
@@ -28,6 +31,9 @@ HTTP 页面可以承载网页、状态和信令；实时视频不应默认设计
 
 - [架构设计](docs/ARCHITECTURE.md)：模块边界、连接流程、网络与媒体数据路径、资源和安全设计。
 - [开发里程碑](docs/ROADMAP.md)：分阶段移植顺序、验收条件和风险关卡。
+- [贡献指南](CONTRIBUTING.md)：本地构建、检查和提交要求。
+- [安全策略](SECURITY.md)：漏洞报告方式与支持范围。
+- [变更记录](CHANGELOG.md)：项目变更摘要。
 
 ## 工程结构
 

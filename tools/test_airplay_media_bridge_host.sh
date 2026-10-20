@@ -6,8 +6,13 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 test_binary=$(mktemp "${TMPDIR:-/tmp}/test-airplay-media-bridge.XXXXXX")
 trap 'rm -f "$test_binary"' EXIT HUP INT TERM
 
+case "$(uname -s)" in
+    Darwin) linker_gc_flag="-Wl,-dead_strip" ;;
+    *) linker_gc_flag="-Wl,--gc-sections" ;;
+esac
+
 clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
-    -ffunction-sections -fdata-sections -Wl,-dead_strip \
+    -ffunction-sections -fdata-sections "$linker_gc_flag" \
     -I"$repo_root/build/config" \
     -I"$IDF_PATH/components/esp_common/include" \
     -I"$IDF_PATH/components/mbedtls/mbedtls/include" \

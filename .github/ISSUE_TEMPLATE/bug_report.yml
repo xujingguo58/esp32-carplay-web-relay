@@ -1,0 +1,46 @@
+name: Bug report
+description: Report a reproducible problem in the firmware, browser page, or documentation.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please remove Wi-Fi passwords, pairing codes, private data, and unrelated device identifiers from logs before posting.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and why it looks wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Configure ...
+        2. Start ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      description: Commit SHA or release tag.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Hardware and software
+      description: ESP32 module, flash/PSRAM, ESP-IDF, iPhone/iOS, and browser details if relevant.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      render: text
