@@ -9,21 +9,11 @@
 
 ## 工作流程
 
-```mermaid
-flowchart LR
-    Phone[iPhone]
-    ESP[ESP32 relay]
-    Browser[车机浏览器]
-    ESP -->|SoftAP| Phone
-    ESP -->|SoftAP| Browser
-    Phone -->|BR/EDR · iAP2 启动| ESP
-    Phone -->|AirPlay · H.264| ESP
-    ESP -->|WebRTC · H.264| Browser
-    Browser -->|WebSocket · touch| ESP
-    ESP -->|AirPlay HID| Phone
-```
+1. ESP32 开启 SoftAP 和 HTTP 服务，iPhone 与车机浏览器接入同一局域网。
+2. iPhone 经 Bluetooth BR/EDR 和 iAP2 启动连接，再与 ESP32 建立 AirPlay 媒体会话。
+3. ESP32 将 H.264 通过 WebRTC 转发到浏览器；浏览器触控经 WebSocket 回传，再由 ESP32 转为 AirPlay HID 输入。
 
-网页由 ESP32 的 HTTP 服务提供；WebSocket 用于会话信令和触控消息，实时视频通过 WebRTC 转发。设计目标是直接转发 H.264，避免在 ESP32 上解码或转码。
+设计目标是直接转发 H.264，避免在 ESP32 上解码或转码。
 
 ## 实现进度
 
