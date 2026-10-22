@@ -18,13 +18,13 @@
 #define CONFIG_CARPLAY_WEBRTC_TEST_STREAM 0
 #endif
 
-#define MEDIA_BRIDGE_TASK_STACK_BYTES (8192)
+#define MEDIA_BRIDGE_TASK_STACK_BYTES (16 * 1024)
 #define MEDIA_BRIDGE_TASK_PRIORITY    (5)
 #define MEDIA_BRIDGE_LOOP_DELAY_MS    (10)
 #define MEDIA_BRIDGE_FRAME_PERIOD_US  (100000)
 #define MEDIA_BRIDGE_SDP_MAX_BYTES    (3072)
-#define MEDIA_BRIDGE_RTP_SEND_POOL    (32768)
-#define MEDIA_BRIDGE_RTP_SEND_QUEUE   (32)
+#define MEDIA_BRIDGE_RTP_SEND_POOL    (16384)
+#define MEDIA_BRIDGE_RTP_SEND_QUEUE   (16)
 #define MEDIA_BRIDGE_MAX_LIVE_FRAME_BYTES (8U * 1024U * 1024U + 4096U)
 #define MEDIA_BRIDGE_LIVE_CONFIG_BYTES 4096U
 
@@ -459,7 +459,10 @@ static void send_test_frame_if_due(void)
 static void media_bridge_task(void *argument)
 {
     (void)argument;
-    ESP_LOGI(TAG, "peer_loop=started task_stack=%u", (unsigned)MEDIA_BRIDGE_TASK_STACK_BYTES);
+    uint32_t peer_loop_count = 0;
+    ESP_LOGI(TAG, "peer_loop=started task_stack_bytes=%u stack_hwm_bytes=%u",
+             (unsigned)MEDIA_BRIDGE_TASK_STACK_BYTES,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
     while (!s_stop_requested) {
         answer_command_t answer;
@@ -479,6 +482,12 @@ static void media_bridge_task(void *argument)
         int result = esp_peer_main_loop(s_peer);
         if (result != ESP_PEER_ERR_NONE && result != ESP_PEER_ERR_WOULD_BLOCK) {
             ESP_LOGW(TAG, "peer_loop=result_%d", result);
+        }
+        if (++peer_loop_count % 100 == 0) {
+            ESP_LOGI(TAG, "peer_loop=health stack_hwm_bytes=%u free_internal=%u free_psram=%u",
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         }
         live_frame_command_t live_frame;
         if (s_live_frame_queue != NULL &&
@@ -603,7 +612,8 @@ esp_err_t media_bridge_start(media_bridge_signal_cb_t signal_cb, void *context)
             .fps = 10,
         },
         .video_dir = ESP_PEER_MEDIA_DIR_SEND_ONLY,
-        .enable_data_channel = true,
+        /* Signaling and touch control use the authenticated WebSocket. */
+        .enable_data_channel = false,
         .ctx = NULL,
         .on_state = peer_state_callback,
         .on_msg = peer_message_callback,
@@ -613,9 +623,17 @@ esp_err_t media_bridge_start(media_bridge_signal_cb_t signal_cb, void *context)
         .extra_size = sizeof(defaults),
     };
 
+    ESP_LOGI(TAG, "peer_open=starting free_internal=%u largest_internal=%u free_psram=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     result = esp_peer_open(&config, esp_peer_get_default_impl(), &s_peer);
     if (result != ESP_PEER_ERR_NONE) {
-        ESP_LOGE(TAG, "peer_open=failed result=%d", result);
+        ESP_LOGE(TAG, "peer_open=failed result=%d meaning=%s free_internal=%u largest_internal=%u free_psram=%u",
+                 result, result == ESP_PEER_ERR_NO_MEM ? "no_memory" : "other",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         delete_media_queues();
         s_signal_cb = NULL;
         s_signal_context = NULL;

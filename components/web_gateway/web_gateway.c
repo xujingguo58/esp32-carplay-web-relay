@@ -2,7 +2,6 @@
 
 #include <math.h>
 #include <stdint.h>
-#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +12,6 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif_ip_addr.h"
-#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
@@ -42,7 +40,7 @@ static bool s_touch_release_pending;
 static web_gateway_rate_limiter_t s_websocket_rate_limiter;
 static bool s_websocket_rate_limited;
 static web_gateway_pairing_t s_pairing;
-static char s_pairing_code[WEB_GATEWAY_PAIRING_CODE_LENGTH + 1];
+static const char s_pairing_code[WEB_GATEWAY_PAIRING_CODE_LENGTH + 1] = "11111111";
 static uint16_t s_display_width_pixels = 320U;
 static uint16_t s_display_height_pixels = 240U;
 static uint16_t s_display_rotation_degrees;
@@ -603,8 +601,6 @@ esp_err_t web_gateway_release_touches(void)
 
 esp_err_t web_gateway_start(void)
 {
-    uint32_t random_code = esp_random();
-    (void)snprintf(s_pairing_code, sizeof(s_pairing_code), "%08" PRIx32, random_code);
     if (!web_gateway_pairing_init(&s_pairing, s_pairing_code)) {
         ESP_LOGE(TAG, "web_pairing=init_failed");
         return ESP_FAIL;
@@ -695,7 +691,7 @@ esp_err_t web_gateway_start(void)
         return err;
     }
 
-    ESP_LOGW(TAG, "web_pairing_code=%s scope=boot_only transport=UART", s_pairing_code);
+    ESP_LOGW(TAG, "web_pairing_code=%s scope=debug_fixed transport=UART", s_pairing_code);
     ESP_LOGI(TAG, "HTTP/WebSocket server listening on port %u touch_watchdog_ms=250",
              config.server_port);
     return ESP_OK;

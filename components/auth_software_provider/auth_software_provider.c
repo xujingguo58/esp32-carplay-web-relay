@@ -148,6 +148,35 @@ static void clear_contexts(void)
     s_ready = false;
 }
 
+static int allow_known_mfi_extension(void *context,
+                                     const mbedtls_x509_crt *certificate,
+                                     const mbedtls_x509_buf *oid,
+                                     int critical,
+                                     const unsigned char *value,
+                                     const unsigned char *value_end)
+{
+    static const unsigned char mfi_extension_oid[] = {
+        0x2a, 0x86, 0x48, 0x86, 0xf7, 0x63, 0x64, 0x06, 0x24,
+    };
+    (void)context;
+    (void)certificate;
+
+    if (oid == NULL || oid->p == NULL || value == NULL || value_end == NULL ||
+        oid->len != sizeof(mfi_extension_oid) ||
+        memcmp(oid->p, mfi_extension_oid, sizeof(mfi_extension_oid)) != 0 ||
+        critical == 0) {
+        return MBEDTLS_ERR_X509_INVALID_EXTENSIONS;
+    }
+
+    const size_t value_len = (size_t)(value_end - value);
+    if (value_len != 34U || value[0] != MBEDTLS_ASN1_OCTET_STRING ||
+        value[1] != ECDSA_P256_COORDINATE_SIZE) {
+        return MBEDTLS_ERR_X509_INVALID_EXTENSIONS;
+    }
+
+    return 0;
+}
+
 esp_err_t auth_software_provider_init(void)
 {
     if (s_ready) return ESP_OK;
@@ -180,9 +209,12 @@ esp_err_t auth_software_provider_init(void)
         return ESP_ERR_INVALID_ARG;
     }
 
-    ret = mbedtls_x509_crt_parse_der(&s_certificate,
-                                     certificate_der_start,
-                                     certificate_der_len);
+    ret = mbedtls_x509_crt_parse_der_with_ext_cb(&s_certificate,
+                                                 certificate_der_start,
+                                                 certificate_der_len,
+                                                 1,
+                                                 allow_known_mfi_extension,
+                                                 NULL);
     if (ret != 0 || s_certificate.next != NULL) {
         ESP_LOGE(TAG, "bundled certificate parse failed: mbedtls=%d", ret);
         clear_contexts();
