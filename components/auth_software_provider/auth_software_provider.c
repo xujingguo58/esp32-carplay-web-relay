@@ -15,7 +15,7 @@
 #include "mbedtls/asn1.h"
 #include "mbedtls/ecp.h"
 #include "mbedtls/pk.h"
-#include "mbedtls/pkcs7.h"
+#include "mbedtls/x509_crt.h"
 
 static const char *TAG = "auth_software";
 
@@ -23,6 +23,8 @@ extern const uint8_t identity_pk8_start[] asm("_binary_identity_pk8_start");
 extern const uint8_t identity_pk8_end[] asm("_binary_identity_pk8_end");
 extern const uint8_t certificate_p7b_start[] asm("_binary_certificate_p7b_start");
 extern const uint8_t certificate_p7b_end[] asm("_binary_certificate_p7b_end");
+extern const uint8_t certificate_der_start[] asm("_binary_certificate_der_start");
+extern const uint8_t certificate_der_end[] asm("_binary_certificate_der_end");
 
 #define MFI_CHALLENGE_SIZE 32U
 #define ECDSA_P256_COORDINATE_SIZE 32U
@@ -30,7 +32,7 @@ extern const uint8_t certificate_p7b_end[] asm("_binary_certificate_p7b_end");
 #define MFI_CERTIFICATE_MAX_SIZE 1536U
 
 static mbedtls_pk_context s_private_key;
-static mbedtls_pkcs7 s_certificate;
+static mbedtls_x509_crt s_certificate;
 static bool s_contexts_initialized;
 static bool s_ready;
 
@@ -138,10 +140,10 @@ static void clear_contexts(void)
 {
     if (s_contexts_initialized) {
         mbedtls_pk_free(&s_private_key);
-        mbedtls_pkcs7_free(&s_certificate);
+        mbedtls_x509_crt_free(&s_certificate);
     }
     mbedtls_pk_init(&s_private_key);
-    mbedtls_pkcs7_init(&s_certificate);
+    mbedtls_x509_crt_init(&s_certificate);
     s_contexts_initialized = true;
     s_ready = false;
 }
@@ -151,7 +153,7 @@ esp_err_t auth_software_provider_init(void)
     if (s_ready) return ESP_OK;
     if (!s_contexts_initialized) {
         mbedtls_pk_init(&s_private_key);
-        mbedtls_pkcs7_init(&s_certificate);
+        mbedtls_x509_crt_init(&s_certificate);
         s_contexts_initialized = true;
     } else {
         clear_contexts();
@@ -159,8 +161,11 @@ esp_err_t auth_software_provider_init(void)
 
     const size_t private_key_len = (size_t)(identity_pk8_end - identity_pk8_start);
     const size_t certificate_len = (size_t)(certificate_p7b_end - certificate_p7b_start);
+    const size_t certificate_der_len =
+        (size_t)(certificate_der_end - certificate_der_start);
     if (private_key_len == 0U || certificate_len == 0U ||
-        certificate_len > MFI_CERTIFICATE_MAX_SIZE) {
+        certificate_len > MFI_CERTIFICATE_MAX_SIZE || certificate_der_len == 0U ||
+        certificate_der_len > MFI_CERTIFICATE_MAX_SIZE) {
         ESP_LOGE(TAG, "bundled identity has invalid size");
         clear_contexts();
         return ESP_ERR_INVALID_SIZE;
@@ -175,17 +180,16 @@ esp_err_t auth_software_provider_init(void)
         return ESP_ERR_INVALID_ARG;
     }
 
-    ret = mbedtls_pkcs7_parse_der(&s_certificate, certificate_p7b_start, certificate_len);
-    if (ret != MBEDTLS_PKCS7_SIGNED_DATA ||
-        s_certificate.MBEDTLS_PRIVATE(signed_data).MBEDTLS_PRIVATE(no_of_certs) != 1) {
+    ret = mbedtls_x509_crt_parse_der(&s_certificate,
+                                     certificate_der_start,
+                                     certificate_der_len);
+    if (ret != 0 || s_certificate.next != NULL) {
         ESP_LOGE(TAG, "bundled certificate parse failed: mbedtls=%d", ret);
         clear_contexts();
         return ESP_ERR_INVALID_ARG;
     }
 
-    mbedtls_x509_crt *certificate =
-        &s_certificate.MBEDTLS_PRIVATE(signed_data).MBEDTLS_PRIVATE(certs);
-    mbedtls_pk_context *certificate_key = &certificate->pk;
+    mbedtls_pk_context *certificate_key = &s_certificate.pk;
     if (!mbedtls_pk_can_do(certificate_key, MBEDTLS_PK_ECDSA) ||
         mbedtls_pk_get_bitlen(certificate_key) != 256U) {
         ESP_LOGE(TAG, "bundled certificate does not contain a P-256 ECDSA key");

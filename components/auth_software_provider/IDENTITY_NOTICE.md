@@ -4,6 +4,7 @@ The two files in `assets/` were extracted from the official DiPlay v0.2.21 relea
 
 - `identity.pk8`: unencrypted PKCS#8 P-256 private key.
 - `certificate.p7b`: DER PKCS#7 certificate container returned by the iAP2 authentication flow.
+- `certificate.der`: X.509 DER certificate extracted from that container for local public/private key matching. The original PKCS#7 bytes remain the certificate payload returned by the provider.
 
 Release APK: <https://github.com/shihabal3amri/DiPlay/releases/download/v0.2.21/DiPlay-0.2.21.apk>
 

@@ -6,3 +6,4 @@ idf_component_register(
 
 target_add_binary_data(${COMPONENT_LIB} "assets/identity.pk8" BINARY)
 target_add_binary_data(${COMPONENT_LIB} "assets/certificate.p7b" BINARY)
+target_add_binary_data(${COMPONENT_LIB} "assets/certificate.der" BINARY)
