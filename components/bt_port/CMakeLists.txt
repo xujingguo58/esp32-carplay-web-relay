@@ -4,6 +4,7 @@ idf_component_register(
     REQUIRES
         bt
         esp_common
+        esp_timer
         freertos
         log
 )

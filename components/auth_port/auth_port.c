@@ -47,6 +47,14 @@ esp_err_t auth_port_sign_challenge(const uint8_t *challenge,
                                      inout_signature_len, s_provider.context);
 }
 
+esp_err_t auth_port_get_protocol_major(uint8_t *protocol_major)
+{
+    if (protocol_major == NULL) return ESP_ERR_INVALID_ARG;
+    if (!s_registered) return ESP_ERR_NOT_SUPPORTED;
+    *protocol_major = s_provider.protocol_major;
+    return ESP_OK;
+}
+
 int auth_port_is_configured(void)
 {
     return s_registered;

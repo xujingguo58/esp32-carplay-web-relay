@@ -11,7 +11,7 @@
 
 #define BPLIST_HEADER_BYTES 8U
 #define BPLIST_TRAILER_BYTES 32U
-#define BPLIST_WRITER_MAX_OBJECTS 8U
+#define BPLIST_WRITER_MAX_OBJECTS 12U
 
 typedef struct {
     uint8_t marker;
@@ -431,7 +431,7 @@ typedef struct {
     bplist_write_kind_t kind;
     const char *text;
     uint64_t number;
-    uint8_t references[4];
+    uint8_t references[12];
     uint8_t reference_count;
 } bplist_write_object_t;
 
@@ -466,8 +466,18 @@ static bool emit_write_object(const bplist_write_object_t *object,
     switch (object->kind) {
     case BPLIST_WRITE_STRING: {
         size_t length = strlen(object->text);
-        if (length >= 15U || *offset >= capacity) return false;
-        output[(*offset)++] = (uint8_t)(0x50U | (uint8_t)length);
+        if (*offset >= capacity) return false;
+        if (length < 15U) {
+            output[(*offset)++] = (uint8_t)(0x50U | (uint8_t)length);
+        } else {
+            /* Binary plist uses a following integer object when the count nibble is 0xf. */
+            output[(*offset)++] = 0x5fU;
+            uint8_t width = integer_width((uint64_t)length);
+            uint8_t power = width == 1U ? 0U : width == 2U ? 1U : width == 4U ? 2U : 3U;
+            if (*offset >= capacity) return false;
+            output[(*offset)++] = (uint8_t)(0x10U | power);
+            if (!write_be(output, capacity, offset, (uint64_t)length, width)) return false;
+        }
         if (length > capacity - *offset) return false;
         memcpy(output + *offset, object->text, length);
         *offset += length;
@@ -560,15 +570,22 @@ airplay_bplist_result_t airplay_bplist_build_initial_setup_response(
     if (timing_port == 0U || event_port == 0U) {
         return AIRPLAY_BPLIST_INVALID_ARGUMENT;
     }
-    bplist_write_object_t objects[5] = {
-        {.kind = BPLIST_WRITE_DICTIONARY, .references = {1U, 3U, 2U, 4U},
-         .reference_count = 4U},
+    bplist_write_object_t objects[9] = {
+        {.kind = BPLIST_WRITE_DICTIONARY,
+         /* Binary-plist dictionaries store all key references before values. */
+         .references = {1U, 3U, 5U, 2U, 4U, 6U},
+         .reference_count = 6U},
         {.kind = BPLIST_WRITE_STRING, .text = "timingPort"},
         {.kind = BPLIST_WRITE_INTEGER, .number = timing_port},
         {.kind = BPLIST_WRITE_STRING, .text = "eventPort"},
         {.kind = BPLIST_WRITE_INTEGER, .number = event_port},
+        {.kind = BPLIST_WRITE_STRING, .text = "enabledFeatures"},
+        {.kind = BPLIST_WRITE_ARRAY, .references = {7U, 8U},
+         .reference_count = 2U},
+        {.kind = BPLIST_WRITE_STRING, .text = "iAPChannel"},
+        {.kind = BPLIST_WRITE_STRING, .text = "viewAreas"},
     };
-    return build_setup_response(objects, 5U, output, output_capacity, output_len);
+    return build_setup_response(objects, 9U, output, output_capacity, output_len);
 }
 
 airplay_bplist_result_t airplay_bplist_build_screen_setup_response(

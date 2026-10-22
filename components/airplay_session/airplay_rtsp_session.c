@@ -10,9 +10,12 @@
 #include <string.h>
 
 #include "airplay_bplist.h"
+#include "airplay_mfi_sap.h"
+#include "esp_log.h"
 #include "mbedtls/platform_util.h"
 
 #define AIRPLAY_PLIST_CONTENT_TYPE "application/x-apple-binary-plist"
+#define AIRPLAY_OCTET_CONTENT_TYPE "application/octet-stream"
 #define AIRPLAY_RTSP_SESSION_SETUP_BODY_BYTES 256U
 #define AIRPLAY_RTSP_SESSION_MAX_SCREEN_KEY_IDS 8U
 #define AIRPLAY_RTSP_SESSION_MAX_SETUP_STREAMS 8U
@@ -20,6 +23,8 @@
 #define AIRPLAY_RTSP_STATUS_BAD_REQUEST 400U
 #define AIRPLAY_RTSP_STATUS_METHOD_NOT_ALLOWED 405U
 #define AIRPLAY_RTSP_STATUS_SESSION_NOT_READY 503U
+
+static const char *TAG = "airplay_rtsp_session";
 
 struct airplay_rtsp_session {
     airplay_rtsp_session_config_t config;
@@ -108,6 +113,46 @@ static airplay_rtsp_session_result_t screen_setup_response(
         body, body_len, response, response_capacity, response_len);
     memset(body, 0, sizeof(body));
     return result;
+}
+
+static airplay_rtsp_session_result_t handle_mfi_auth_setup(
+    const airplay_rtsp_request_t *request,
+    uint8_t *response,
+    size_t response_capacity,
+    size_t *response_len)
+{
+    if (strcmp(request->method, "POST") != 0) {
+        return status_response(request, AIRPLAY_RTSP_STATUS_METHOD_NOT_ALLOWED,
+                               "Method Not Allowed", response,
+                               response_capacity, response_len);
+    }
+
+    uint8_t body[AIRPLAY_MFI_SAP_MAX_RESPONSE_BYTES];
+    size_t body_len = 0U;
+    airplay_mfi_sap_result_t result = airplay_mfi_sap_respond(
+        request->body, request->body_len, body, sizeof(body), &body_len);
+    if (result != AIRPLAY_MFI_SAP_OK) {
+        mbedtls_platform_zeroize(body, sizeof(body));
+        const unsigned status = result == AIRPLAY_MFI_SAP_INVALID_ARGUMENT
+                                    ? AIRPLAY_RTSP_STATUS_BAD_REQUEST
+                                : result == AIRPLAY_MFI_SAP_UNAVAILABLE ||
+                                          result == AIRPLAY_MFI_SAP_UNSUPPORTED_PROTOCOL
+                                    ? AIRPLAY_RTSP_STATUS_SESSION_NOT_READY
+                                    : 500U;
+        const char *reason = status == AIRPLAY_RTSP_STATUS_BAD_REQUEST
+                                 ? "Bad Request"
+                             : status == AIRPLAY_RTSP_STATUS_SESSION_NOT_READY
+                                 ? "Service Unavailable"
+                                 : "Internal Server Error";
+        return status_response(request, status, reason, response,
+                               response_capacity, response_len);
+    }
+
+    airplay_rtsp_session_result_t response_result = build_response(
+        request, AIRPLAY_RTSP_STATUS_OK, "OK", AIRPLAY_OCTET_CONTENT_TYPE,
+        body, body_len, response, response_capacity, response_len);
+    mbedtls_platform_zeroize(body, sizeof(body));
+    return response_result;
 }
 
 static bool screen_connection_id_was_used(const airplay_rtsp_session_t *session,
@@ -336,6 +381,10 @@ static airplay_rtsp_session_result_t handle_setup(
         result = build_response(request, AIRPLAY_RTSP_STATUS_OK, "OK",
                                 AIRPLAY_PLIST_CONTENT_TYPE, body, body_len,
                                 response, response_capacity, response_len);
+        if (result == AIRPLAY_RTSP_SESSION_OK) {
+            ESP_LOGI(TAG, "setup=initial timing_port=%u event_port=%u enabled_features=iAPChannel,viewAreas",
+                     (unsigned)session->timing_port, (unsigned)session->event_port);
+        }
         memset(body, 0, sizeof(body));
         if (result != AIRPLAY_RTSP_SESSION_OK) {
             if (started_timing_now && session->config.stop_timing != NULL) {
@@ -375,6 +424,8 @@ static airplay_rtsp_session_result_t handle_setup(
                                    "Bad Request", response, response_capacity,
                                    response_len);
         }
+        ESP_LOGI(TAG, "setup=stream_candidate index=%u type=%llu",
+                 (unsigned)index, (unsigned long long)candidate_type);
         if (candidate_type != 110U) continue;
         if (has_screen_stream) {
             return status_response(request, AIRPLAY_RTSP_STATUS_BAD_REQUEST,
@@ -386,6 +437,7 @@ static airplay_rtsp_session_result_t handle_setup(
     }
 
     if (!has_screen_stream) {
+        ESP_LOGW(TAG, "setup=streams_without_main_screen count=%u", (unsigned)stream_count);
         if (airplay_bplist_build_empty_stream_setup_response(
                 body, sizeof(body), &body_len) != AIRPLAY_BPLIST_OK) {
             return status_response(request, AIRPLAY_RTSP_STATUS_SESSION_NOT_READY,
@@ -445,6 +497,9 @@ static airplay_rtsp_session_result_t handle_setup(
         session->active_screen_connection_id = connection_id;
     }
     if (!screen_started || bound_port == 0U) {
+        ESP_LOGE(TAG, "screen_start=failed stream_type=%llu connection_id=%llu port=%u",
+                 (unsigned long long)stream_type,
+                 (unsigned long long)connection_id, (unsigned)bound_port);
         if (screen_started && session->config.stop_screen != NULL) {
             session->config.stop_screen(session->config.media_context);
         }
@@ -454,6 +509,9 @@ static airplay_rtsp_session_result_t handle_setup(
     }
     session->screen_started = true;
     session->screen_port = bound_port;
+    ESP_LOGI(TAG, "screen_start=ready stream_type=%llu connection_id=%llu port=%u",
+             (unsigned long long)stream_type,
+             (unsigned long long)connection_id, (unsigned)bound_port);
     result = screen_setup_response(request, stream_type, bound_port,
                                    response, response_capacity, response_len);
     if (result != AIRPLAY_RTSP_SESSION_OK && session->config.stop_screen != NULL) {
@@ -540,6 +598,11 @@ airplay_rtsp_session_result_t airplay_rtsp_session_handle(
                                response, response_capacity, response_len);
     }
 
+    if (path_has_suffix(request->path, "/auth-setup")) {
+        return handle_mfi_auth_setup(request, response, response_capacity,
+                                     response_len);
+    }
+
     if (path_has_suffix(request->path, "/info")) {
         if (!session->has_info) {
             return status_response(request, AIRPLAY_RTSP_STATUS_SESSION_NOT_READY,
@@ -557,12 +620,10 @@ airplay_rtsp_session_result_t airplay_rtsp_session_handle(
                             response_len);
     }
     if (strcmp(request->method, "RECORD") == 0) {
-        if (!session->screen_started) {
-            return status_response(request, AIRPLAY_RTSP_STATUS_SESSION_NOT_READY,
-                                   "Service Unavailable", response,
-                                   response_capacity, response_len);
-        }
         session->record_active = true;
+        ESP_LOGI(TAG, "record=accepted screen_started=%u screen_port=%u",
+                 session->screen_started ? 1U : 0U,
+                 (unsigned)session->screen_port);
         return status_response(request, AIRPLAY_RTSP_STATUS_OK, "OK",
                                response, response_capacity, response_len);
     }

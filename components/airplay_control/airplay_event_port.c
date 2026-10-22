@@ -112,7 +112,14 @@ static void event_task(void *argument)
                     if (received < 0 && errno == EINTR) continue;
                     if (received < 0 &&
                         (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-                    if (received <= 0) break;
+                    if (received == 0) {
+                        ESP_LOGW(TAG, "event_connection=peer_closed");
+                        break;
+                    }
+                    if (received < 0) {
+                        ESP_LOGW(TAG, "event_connection=receive_failed errno=%d", errno);
+                        break;
+                    }
                     esp_err_t receive_result = airplay_control_port_receive_encrypted(
                         rx, (size_t)received);
                     if (receive_result != ESP_OK) {

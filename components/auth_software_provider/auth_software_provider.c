@@ -14,6 +14,7 @@
 #include "esp_random.h"
 #include "mbedtls/asn1.h"
 #include "mbedtls/ecp.h"
+#include "mbedtls/md.h"
 #include "mbedtls/pk.h"
 #include "mbedtls/x509_crt.h"
 
@@ -26,7 +27,8 @@ extern const uint8_t certificate_p7b_end[] asm("_binary_certificate_p7b_end");
 extern const uint8_t certificate_der_start[] asm("_binary_certificate_der_start");
 extern const uint8_t certificate_der_end[] asm("_binary_certificate_der_end");
 
-#define MFI_CHALLENGE_SIZE 32U
+#define MFI_SHA1_DIGEST_SIZE 20U
+#define MFI_SHA256_DIGEST_SIZE 32U
 #define ECDSA_P256_COORDINATE_SIZE 32U
 #define ECDSA_P256_RAW_SIGNATURE_SIZE (2U * ECDSA_P256_COORDINATE_SIZE)
 #define MFI_CERTIFICATE_MAX_SIZE 1536U
@@ -106,7 +108,10 @@ static esp_err_t sign_challenge(const uint8_t *challenge, size_t challenge_len,
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_ready) return ESP_ERR_INVALID_STATE;
-    if (challenge_len != MFI_CHALLENGE_SIZE) return ESP_ERR_INVALID_SIZE;
+    if (challenge_len != MFI_SHA1_DIGEST_SIZE &&
+        challenge_len != MFI_SHA256_DIGEST_SIZE) {
+        return ESP_ERR_INVALID_SIZE;
+    }
     if (*inout_signature_len < ECDSA_P256_RAW_SIGNATURE_SIZE) {
         *inout_signature_len = ECDSA_P256_RAW_SIGNATURE_SIZE;
         return ESP_ERR_NO_MEM;
@@ -114,7 +119,10 @@ static esp_err_t sign_challenge(const uint8_t *challenge, size_t challenge_len,
 
     unsigned char der_signature[MBEDTLS_PK_SIGNATURE_MAX_SIZE];
     size_t der_signature_len = 0U;
-    int ret = mbedtls_pk_sign(&s_private_key, MBEDTLS_MD_SHA256,
+    const mbedtls_md_type_t md_type = challenge_len == MFI_SHA1_DIGEST_SIZE
+                                          ? MBEDTLS_MD_SHA1
+                                          : MBEDTLS_MD_SHA256;
+    int ret = mbedtls_pk_sign(&s_private_key, md_type,
                               challenge, challenge_len,
                               der_signature, sizeof(der_signature), &der_signature_len,
                               provider_random, NULL);
@@ -239,6 +247,7 @@ esp_err_t auth_software_provider_init(void)
     const auth_port_provider_t provider = {
         .read_certificate = read_certificate,
         .sign_challenge = sign_challenge,
+        .protocol_major = 3,
         .context = NULL,
     };
     esp_err_t err = auth_port_register_provider(&provider);

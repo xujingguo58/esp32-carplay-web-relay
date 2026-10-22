@@ -805,7 +805,7 @@ void media_bridge_stop(void)
 
 bool media_bridge_is_connected(void)
 {
-    return s_connected;
+    return s_started && s_connected && !s_stop_requested;
 }
 
 uint32_t media_bridge_frames_sent(void)

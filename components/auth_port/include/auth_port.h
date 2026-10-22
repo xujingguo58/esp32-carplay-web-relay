@@ -13,6 +13,7 @@ typedef struct {
                                 uint8_t *signature,
                                 size_t *inout_signature_len,
                                 void *context);
+    uint8_t protocol_major;
     void *context;
 } auth_port_provider_t;
 
@@ -22,5 +23,6 @@ esp_err_t auth_port_sign_challenge(const uint8_t *challenge,
                                    size_t challenge_len,
                                    uint8_t *signature,
                                    size_t *inout_signature_len);
+esp_err_t auth_port_get_protocol_major(uint8_t *protocol_major);
 int auth_port_is_configured(void);
 

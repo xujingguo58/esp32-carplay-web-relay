@@ -95,7 +95,7 @@ Android `Activity`、`BluetoothSocket`、`WifiP2pManager`、`MediaCodec`、`Audi
 4. 视频帧使用 DataStream 输出密钥和 ChaCha20-Poly1305 解密，nonce 为 4 字节零加 8 字节小端帧计数，128 字节头作为 AAD，帧体末尾 16 字节为认证标签。
 5. H.264 access unit 和时间戳进入 `media_bridge` 的 `esp_peer` WebRTC H.264 发送接口；优先使用 AirPlay sender 时间构造会话相对 90 kHz PTS。sender 时间缺失或回退后，使用到达时间并保持时间轴不倒退；浏览器侧负责解码，ESP32 不承担视频解码和重编码。
 
-代码现状：`airplay_screen` 已实现上述数据消息头校验、单连接 TCP listener、ChaCha20-Poly1305 解密、带 `avcC` 标记或裸 AVCDecoderConfigurationRecord 的 SPS/PPS 提取、长度前缀转 Annex-B，以及 HKDF-SHA512 输出密钥派生。Screen body 上限为 8 MiB（含 tag），RX、解密和 staging 缓冲按需增长并记录高水位；完整路径会同时持有三份数据，最大帧仍受 PSRAM、碎片及 Wi-Fi/WebRTC 运行内存影响。默认与 4/8 MB profile 未启用 SPIRAM，需按实际模组能力配置。接收或解密缓冲分配失败会关闭所属 RTSP 会话；媒体 staging 分配失败会丢帧并等待 IDR。主机测试覆盖 600 KiB AEAD access unit、时间戳、坏 tag、单 peer 与清理，但不模拟 ESP32 PSRAM 碎片或真实 WebRTC 峰值。`airplay_media_bridge` 将解密帧接入媒体桥；`media_timestamp` 优先使用 AirPlay sender 时间构造会话相对 90 kHz PTS，失效或回退时切换到到达时间。RTSP 实现 Pair-Setup/Verify、ControlCipher、`/info`、有界 streams SETUP、RECORD/TEARDOWN；初始 SETUP 启动 Event 和 UDP timing listener。Mbed TLS 承担 SRP-6a、X25519、HKDF 和 ChaCha20-Poly1305；Pair-Verify 派生 Control/Event 密钥。默认 `airplay_software_provider` 使用随机 NVS seed 与 UUID 派生 Ed25519 身份，提供 Pair-Setup/Verify 签名/验签、NVS controller 存储、`/info` 和 mDNS TXT。Provider 和启动路径已有构建/主机测试，但实际 mDNS、iPhone 配对、H.264 接收及 `esp_peer` 浏览器发送仍待板卡验证。
+代码现状：`airplay_screen` 已实现上述数据消息头校验、单连接 TCP listener、ChaCha20-Poly1305 解密、带 `avcC` 标记或裸 AVCDecoderConfigurationRecord 的 SPS/PPS 提取、长度前缀转 Annex-B，以及 HKDF-SHA512 输出密钥派生。Screen body 上限为 8 MiB（含 tag），RX、解密和 staging 缓冲按需增长并记录高水位；完整路径会同时持有三份数据，最大帧仍受 PSRAM、碎片及 Wi-Fi/WebRTC 运行内存影响。默认和 4 MB profile 未启用 SPIRAM；8 MB Flash 调试 profile 已启用 40 MHz PSRAM 自动检测，并将 mbedTLS 工作分配放入 PSRAM，允许无 PSRAM 时继续启动，但没有 PSRAM 时 WebRTC peer 仍可能无法建立。当前 8 MB profile 要求经典 ESP32 Rev 3.0 或更新版本。主机测试覆盖 600 KiB AEAD access unit、时间戳、坏 tag、单 peer 与清理，但不模拟 ESP32 PSRAM 碎片或真实 WebRTC 峰值。`airplay_media_bridge` 将解密帧接入媒体桥；`media_timestamp` 优先使用 AirPlay sender 时间构造会话相对 90 kHz PTS，失效或回退时切换到到达时间。RTSP 实现 Pair-Setup/Verify、ControlCipher、`/info`、有界 streams SETUP、RECORD/TEARDOWN；初始 SETUP 启动 Event 和 UDP timing listener。Mbed TLS 承担 SRP-6a、X25519、HKDF 和 ChaCha20-Poly1305；Pair-Verify 派生 Control/Event 密钥。默认 `airplay_software_provider` 使用随机 NVS seed 与 UUID 派生 Ed25519 身份，提供 Pair-Setup/Verify 签名/验签、NVS controller 存储、`/info` 和 mDNS TXT。Provider 和启动路径已有构建/主机测试，但实际 mDNS、iPhone 配对、H.264 接收及 `esp_peer` 浏览器发送仍待板卡验证。
 
 Event listener 的非预期退出会关闭所属 RTSP 连接；同一 RTSP/Pair-Verify 会话中最多使用一次 Event 密钥。TEARDOWN 停止已连接的 Event 通道后，不允许在同一会话内重新打开通道，客户端需要建立新会话取得新密钥，以免 ControlCipher 计数器从零开始后复用 AEAD nonce。
 
@@ -108,8 +108,8 @@ Event listener 的非预期退出会关闭所属 RTSP 连接；同一 RTSP/Pair-
 ### 3.5 Web 服务与网页 `web_gateway`
 
 - ESP HTTP 服务当前提供单页样机、状态 API 和 `/ws` WebSocket 信令/触控；`GET /` 和 `GET /api/status` 已落地。状态 API 报告当前及启动以来最低内部堆/PSRAM 余量。
-- 当前 `/ws` 限制单个媒体浏览器，并要求输入每次启动随机生成的 8 位十六进制配对码；该码只打印到 UART，不由网页或状态 API 暴露。五次错误后锁定 30 秒。入站消息按 120 消息/秒、120 条突发额度限流，超限会释放触点并关闭连接。尚无 TLS 或产品级配对码 provisioning，服务仅供设置了 WPA2 密码的开发 SoftAP 使用。
-- 网页以 `RTCPeerConnection` 接收 H.264 视频；输入事件经 WebSocket 或 WebRTC DataChannel 返回 ESP32。
+- 当前 `/ws` 限制单个媒体浏览器，并要求输入网页配对码；调试构建固定使用 `11111111`，只打印到 UART，不由网页或状态 API 暴露。五次错误后锁定 30 秒。入站消息按 120 消息/秒、120 条突发额度限流，超限会释放触点并关闭连接。尚无 TLS 或产品级配对码 provisioning，服务仅供设置了 WPA2 密码的开发 SoftAP 使用。
+- 网页以 `RTCPeerConnection` 接收 H.264 视频；SDP/ICE 信令和触控事件使用已配对的 WebSocket。当前不启用 WebRTC DataChannel，以减少 ESP32 的运行时内存占用。
 - SDP answer 仅在所有 ESP Peer offer 的 `a=setup` 字段都是 `actpass` 时将浏览器的 `active` answer 改成 `passive`；active、passive、混合或缺少角色的 offer 保留 WebRTC 自己生成的 answer。`node tools/test_web_gateway_page.mjs` 从固件实际内嵌 HTML 提取整页脚本检查语法，并测试该角色选择 helper；仍需目标浏览器与 ESP32 的 DTLS 实际协商。
 - 网页静态资源放入只读文件系统或固件资源分区，并启用压缩。
 - 当前只限制单个浏览器媒体会话；配对码随设备重启更新，浏览器不持久化配对码。不要在不受信任的网络上开放服务。

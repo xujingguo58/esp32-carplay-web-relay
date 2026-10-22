@@ -170,11 +170,14 @@ bool iap2_identity_build_wireless_omitting(const iap2_identity_config_t *config,
     }
 
     size_t used = 0;
+    /* Match DiPlay's wireless accessory message list, excluding its app-specific EA channel. */
     const uint16_t sent_messages[] = {
-        0xaa01, 0xaa03, 0x5000, 0x5200, 0xae00, 0x4157, 0x4154, 0x4301, 0x5703,
+        0xaa01, 0xaa03, 0x5000, 0x5002, 0x5200, 0x5203, 0xae00, 0xae02,
+        0x4157, 0x4159, 0x4154, 0x4156, 0x4301, 0x5703,
     };
     const uint16_t received_messages[] = {
-        0xaa00, 0xaa02, 0xaa04, 0xaa05, 0x5702, 0x4300, 0x4e0d, 0x4e0e,
+        0xaa00, 0xaa02, 0xaa04, 0xaa05, 0x5001, 0x5201, 0x5202, 0xae01,
+        0x4158, 0x4155, 0x4300, 0x4e0d, 0x4e0e, 0x5702,
     };
     uint16_t filtered_sent[sizeof(sent_messages) / sizeof(sent_messages[0])];
     size_t filtered_sent_count = 0U;
@@ -243,6 +246,19 @@ bool iap2_identity_build_wireless_omitting(const iap2_identity_config_t *config,
         !append_void(wifi_transport, sizeof(wifi_transport), &wifi_transport_len, 4) ||
         !append_void(wifi_transport, sizeof(wifi_transport), &wifi_transport_len, 5) ||
         !append_group(output, output_capacity, &used, 24, wifi_transport, wifi_transport_len)) {
+        return false;
+    }
+
+    uint8_t route_guidance[96];
+    size_t route_guidance_len = 0U;
+    if (!append_u16(route_guidance, sizeof(route_guidance), &route_guidance_len, 0, 42) ||
+        !append_string(route_guidance, sizeof(route_guidance), &route_guidance_len, 1,
+                       "RouteGuidance") ||
+        !append_u16(route_guidance, sizeof(route_guidance), &route_guidance_len, 2, 64) ||
+        !append_u16(route_guidance, sizeof(route_guidance), &route_guidance_len, 4, 64) ||
+        !append_u16(route_guidance, sizeof(route_guidance), &route_guidance_len, 6, 8) ||
+        !append_group(output, output_capacity, &used, 30,
+                      route_guidance, route_guidance_len)) {
         return false;
     }
 

@@ -244,7 +244,6 @@ static void event_state_changed(bool connected, void *context)
 {
     airplay_rtsp_server_t *server = context;
     if (server == NULL) return;
-    int rtsp_fd = -1;
     bool unexpected_exit = false;
     portENTER_CRITICAL(&s_server_mux);
     server->event_connected = connected;
@@ -257,12 +256,10 @@ static void event_state_changed(bool connected, void *context)
          * listener/attach failures before a successful connection. */
         server->event_failed = true;
         unexpected_exit = true;
-        rtsp_fd = server->client_fd;
     }
     portEXIT_CRITICAL(&s_server_mux);
     if (unexpected_exit) {
-        ESP_LOGW(TAG, "event_channel=lost rtsp_session=closing key_reuse=blocked");
-        if (rtsp_fd >= 0) shutdown(rtsp_fd, SHUT_RDWR);
+        ESP_LOGW(TAG, "event_channel=lost rtsp_session=continuing input=disabled key_reuse=blocked");
     }
     if (server->config.on_event_state != NULL) {
         server->config.on_event_state(connected,
@@ -505,7 +502,14 @@ static void serve_client(airplay_rtsp_server_t *server, int client_fd)
         int received = recv(client_fd, rx, sizeof(rx), 0);
         if (received < 0 && errno == EINTR) continue;
         if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-        if (received <= 0) break;
+        if (received == 0) {
+            ESP_LOGI(TAG, "rtsp_client=peer_closed stage=control");
+            break;
+        }
+        if (received < 0) {
+            ESP_LOGW(TAG, "rtsp_client=receive_failed errno=%d", errno);
+            break;
+        }
         if (!process_received_bytes(server, connection, session, client_fd,
                                     rx, (size_t)received)) {
             break;

@@ -24,6 +24,7 @@ idf_component_register(
         iap2_mfi_auth
         log
         mdns
+        media_bridge
         net_port
         nvs_flash
         web_gateway

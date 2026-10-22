@@ -25,12 +25,14 @@
 #include "iap2_identity.h"
 #include "iap2_mfi_auth.h"
 #include "net_port.h"
+#include "media_bridge.h"
 #include "web_gateway.h"
 #include "time_port.h"
 
 #define IAP2_EVENT_QUEUE_DEPTH 8
 #define IAP2_EVENT_DATA_BYTES 512
-#define IAP2_WORKER_STACK_BYTES 8192
+#define IAP2_WORKER_STACK_BYTES 12288
+#define IAP2_IDENTIFICATION_MAX_RETRIES 4U
 #define IAP2_PRE_TRANSPORT_WIFI_CONFIG_LIMIT 5
 #define IAP2_POST_TRANSPORT_WIFI_CONFIG_LIMIT 2
 
@@ -55,9 +57,13 @@ static bool s_iap2_start_session_sent;
 static bool s_iap2_transport_notification_seen;
 static uint8_t s_iap2_pre_transport_wifi_config_count;
 static uint8_t s_iap2_post_transport_wifi_config_count;
+static bool s_iap2_identification_accepted;
+static bool s_iap2_subscriptions_sent;
 static uint16_t s_iap2_omitted_message_ids[IAP2_IDENTITY_MAX_OMITTED_MESSAGES];
 static size_t s_iap2_omitted_message_count;
-static bool s_iap2_identification_retry_used;
+static uint8_t s_iap2_identification_retry_count;
+static uint8_t s_iap2_certificate_buffer[1536];
+static uint8_t s_iap2_auth_body_buffer[sizeof(s_iap2_certificate_buffer) + 4U];
 static bool s_airplay_identity_ready;
 static airplay_identity_config_t s_airplay_identity;
 static airplay_rtsp_server_t *s_airplay_server;
@@ -128,13 +134,15 @@ static void reset_iap2_wireless_negotiation(void)
     s_iap2_transport_notification_seen = false;
     s_iap2_pre_transport_wifi_config_count = 0U;
     s_iap2_post_transport_wifi_config_count = 0U;
+    s_iap2_subscriptions_sent = false;
 }
 
 static void reset_iap2_identification(void)
 {
     memset(s_iap2_omitted_message_ids, 0, sizeof(s_iap2_omitted_message_ids));
     s_iap2_omitted_message_count = 0U;
-    s_iap2_identification_retry_used = false;
+    s_iap2_identification_retry_count = 0U;
+    s_iap2_identification_accepted = false;
 }
 
 static void reset_iap2_connection_state(void)
@@ -302,25 +310,54 @@ static void handle_start_identification(void)
 
 static void handle_identification_rejected(const uint8_t *body, size_t body_len)
 {
-    if (s_iap2_identification_retry_used) {
-        ESP_LOGE(TAG, "iap2_identification=rejected reason=retry_already_used");
-        return;
-    }
     uint16_t rejected_message_ids[IAP2_IDENTITY_MAX_OMITTED_MESSAGES];
     size_t rejected_message_count = 0U;
     if (!iap2_identity_parse_unsupported_messages(body, body_len,
                                                  rejected_message_ids,
                                                  IAP2_IDENTITY_MAX_OMITTED_MESSAGES,
                                                  &rejected_message_count)) {
-        ESP_LOGE(TAG, "iap2_identification=rejected reason=unsupported_fields_not_retryable");
+        ESP_LOGE(TAG, "iap2_identification=rejected reason=unsupported_fields_not_retryable bytes=%u",
+                 (unsigned)body_len);
+        for (size_t i = 0; i < body_len; ++i) {
+            ESP_LOGW(TAG, "iap2_identification=rejection_byte offset=%u value=0x%02x",
+                     (unsigned)i, body[i]);
+        }
         return;
     }
-    memcpy(s_iap2_omitted_message_ids, rejected_message_ids,
-           rejected_message_count * sizeof(rejected_message_ids[0]));
-    s_iap2_omitted_message_count = rejected_message_count;
-    s_iap2_identification_retry_used = true;
-    ESP_LOGW(TAG, "iap2_identification=retry_without_unsupported_messages count=%u",
-             (unsigned)rejected_message_count);
+
+    size_t added_count = 0U;
+    for (size_t i = 0; i < rejected_message_count; ++i) {
+        const uint16_t message_id = rejected_message_ids[i];
+        ESP_LOGW(TAG, "iap2_identification=unsupported_message id=0x%04x", message_id);
+        bool already_omitted = false;
+        for (size_t j = 0; j < s_iap2_omitted_message_count; ++j) {
+            if (s_iap2_omitted_message_ids[j] == message_id) {
+                already_omitted = true;
+                break;
+            }
+        }
+        if (already_omitted) continue;
+        if (s_iap2_omitted_message_count >= IAP2_IDENTITY_MAX_OMITTED_MESSAGES) {
+            ESP_LOGE(TAG, "iap2_identification=rejected reason=unsupported_message_limit_reached");
+            return;
+        }
+        s_iap2_omitted_message_ids[s_iap2_omitted_message_count++] = message_id;
+        ++added_count;
+    }
+    if (added_count == 0U) {
+        ESP_LOGE(TAG, "iap2_identification=rejected reason=no_new_unsupported_messages retries=%u",
+                 (unsigned)s_iap2_identification_retry_count);
+        return;
+    }
+    if (s_iap2_identification_retry_count >= IAP2_IDENTIFICATION_MAX_RETRIES) {
+        ESP_LOGE(TAG, "iap2_identification=rejected reason=retry_limit_reached retries=%u",
+                 (unsigned)s_iap2_identification_retry_count);
+        return;
+    }
+    ++s_iap2_identification_retry_count;
+    ESP_LOGW(TAG, "iap2_identification=retry_without_unsupported_messages retry=%u added=%u total=%u",
+             (unsigned)s_iap2_identification_retry_count, (unsigned)added_count,
+             (unsigned)s_iap2_omitted_message_count);
     (void)send_identification_information();
 }
 
@@ -330,16 +367,17 @@ static void handle_authentication_certificate(void)
         ESP_LOGE(TAG, "iap2_mfi=certificate_unavailable auth_provider=not_configured");
         return;
     }
-    uint8_t certificate[1536];
-    size_t certificate_len = sizeof(certificate);
-    esp_err_t err = auth_port_read_certificate(certificate, &certificate_len);
-    if (err != ESP_OK || certificate_len == 0 || certificate_len > sizeof(certificate)) {
+    size_t certificate_len = sizeof(s_iap2_certificate_buffer);
+    esp_err_t err = auth_port_read_certificate(s_iap2_certificate_buffer, &certificate_len);
+    if (err != ESP_OK || certificate_len == 0 ||
+        certificate_len > sizeof(s_iap2_certificate_buffer)) {
         ESP_LOGE(TAG, "iap2_mfi=certificate_read_failed error=%s", esp_err_to_name(err));
         return;
     }
-    uint8_t body[sizeof(certificate) + 4U];
-    size_t body_len = encode_bytes_parameter(body, sizeof(body), 0, certificate, certificate_len);
-    if (body_len == 0 || !send_iap2_csm(0xaa01, body, body_len)) {
+    size_t body_len = encode_bytes_parameter(s_iap2_auth_body_buffer,
+                                             sizeof(s_iap2_auth_body_buffer), 0,
+                                             s_iap2_certificate_buffer, certificate_len);
+    if (body_len == 0 || !send_iap2_csm(0xaa01, s_iap2_auth_body_buffer, body_len)) {
         ESP_LOGE(TAG, "iap2_mfi=certificate_send_failed bytes=%u", (unsigned)certificate_len);
         return;
     }
@@ -396,6 +434,14 @@ static bool handle_authentication_challenge(const uint8_t *body, size_t body_len
     return true;
 }
 
+static bool iap2_message_is_omitted(uint16_t message_id)
+{
+    for (size_t i = 0; i < s_iap2_omitted_message_count; ++i) {
+        if (s_iap2_omitted_message_ids[i] == message_id) return true;
+    }
+    return false;
+}
+
 static void send_wireless_subscriptions(void)
 {
     uint8_t body[64];
@@ -414,14 +460,18 @@ static void send_wireless_subscriptions(void)
     }
     (void)append_parameter(body, sizeof(body), &body_len, 0, group0, group0_len);
     (void)append_parameter(body, sizeof(body), &body_len, 1, group1, group1_len);
-    (void)send_iap2_csm(0x5000, body, body_len);
+    if (!iap2_message_is_omitted(0x5000)) {
+        (void)send_iap2_csm(0x5000, body, body_len);
+    }
 
     body_len = 0;
     uint8_t route_id[2] = {0, 42};
     (void)append_parameter(body, sizeof(body), &body_len, 0, route_id, sizeof(route_id));
     (void)append_void_parameter(body, sizeof(body), &body_len, 1);
     (void)append_void_parameter(body, sizeof(body), &body_len, 2);
-    (void)send_iap2_csm(0x5200, body, body_len);
+    if (!iap2_message_is_omitted(0x5200)) {
+        (void)send_iap2_csm(0x5200, body, body_len);
+    }
 
     static const uint16_t message_ids[] = {0xae00, 0x4157, 0x4154};
     static const uint8_t parameter_ids[][6] = {
@@ -431,12 +481,28 @@ static void send_wireless_subscriptions(void)
     };
     static const uint8_t parameter_counts[] = {3, 3, 6};
     for (size_t i = 0; i < sizeof(message_ids) / sizeof(message_ids[0]); ++i) {
+        if (iap2_message_is_omitted(message_ids[i])) {
+            ESP_LOGW(TAG, "iap2_subscription=skipped reason=message_omitted id=0x%04x",
+                     message_ids[i]);
+            continue;
+        }
         body_len = 0;
         for (size_t j = 0; j < parameter_counts[i]; ++j) {
             (void)append_void_parameter(body, sizeof(body), &body_len, parameter_ids[i][j]);
         }
         (void)send_iap2_csm(message_ids[i], body, body_len);
     }
+}
+
+static void maybe_send_wireless_subscriptions(void)
+{
+    if (s_iap2_subscriptions_sent || !s_iap2_identification_accepted ||
+        !iap2_mfi_auth_is_authenticated(&s_iap2_mfi_auth)) {
+        return;
+    }
+    send_wireless_subscriptions();
+    s_iap2_subscriptions_sent = true;
+    ESP_LOGI(TAG, "iap2_subscriptions=sent after=identification_and_mfi_authentication");
 }
 
 static bool send_wifi_configuration(bool post_transport)
@@ -550,7 +616,9 @@ static void iap2_message(uint16_t message_id, const uint8_t *body, size_t body_l
         handle_start_identification();
         break;
     case 0x1d02:
+        s_iap2_identification_accepted = true;
         ESP_LOGI(TAG, "iap2_identification=accepted");
+        maybe_send_wireless_subscriptions();
         break;
     case 0x1d03:
         handle_identification_rejected(body, body_len);
@@ -587,7 +655,7 @@ static void iap2_message(uint16_t message_id, const uint8_t *body, size_t body_l
                      iap2_mfi_auth_stage_name(iap2_mfi_auth_stage(&s_iap2_mfi_auth)));
         } else {
             ESP_LOGI(TAG, "iap2_mfi=authentication_succeeded");
-            send_wireless_subscriptions();
+            maybe_send_wireless_subscriptions();
         }
         break;
     case 0x5702:
@@ -706,6 +774,9 @@ static void iap2_worker(void *argument)
 
     iap2_runtime_event_t event;
     while (true) {
+        /* The browser must finish authenticated WebRTC setup before we invite
+         * the phone to start CarPlay. Reuse this worker rather than another task. */
+        bt_port_set_discovery_enabled(media_bridge_is_connected());
         if (xQueueReceive(s_iap2_events, &event, pdMS_TO_TICKS(50)) == pdTRUE) {
             switch (event.type) {
             case IAP2_RUNTIME_CONNECTED:
@@ -857,5 +928,5 @@ void app_main(void)
     bool airplay_running = airplay_rtsp_server_is_running();
     ESP_LOGI(TAG, "airplay_rtsp_server=%s reason=%s",
              airplay_running ? "running" : "not_started", s_airplay_server_reason);
-    ESP_LOGI(TAG, "SoftAP/HTTP/WebRTC sample and BR/EDR RFCOMM iAP2 link are ready; open http://192.168.4.1/");
+    ESP_LOGI(TAG, "startup=waiting_for_browser open=http://192.168.4.1/ pairing_code=11111111 phone_discovery=after_webrtc_connected");
 }
