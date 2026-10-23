@@ -192,6 +192,7 @@ static bool read_screen_body(airplay_screen_server_t *server, int fd, size_t siz
 static void handle_client(airplay_screen_server_t *server, int fd)
 {
     uint8_t header[AIRPLAY_SCREEN_HEADER_BYTES];
+    uint32_t ignored_messages = 0U;
     while (!is_stopping(server)) {
         if (!read_fully(server, fd, header, sizeof(header))) break;
         uint32_t body_len = (uint32_t)header[0] | ((uint32_t)header[1] << 8) |
@@ -199,11 +200,20 @@ static void handle_client(airplay_screen_server_t *server, int fd)
         airplay_screen_header_info_t info;
         if (body_len > server->max_body_bytes ||
             !airplay_screen_parse_header(header, body_len, &info)) {
-            ESP_LOGW(TAG, "screen_message=rejected body_bytes=%" PRIu32, body_len);
+            ESP_LOGW(TAG, "screen_message=rejected opcode=%u body_bytes=%" PRIu32,
+                     (unsigned)header[4], body_len);
             break;
         }
         size_t old_rx_capacity = server->rx_body_capacity;
         if (body_len != 0U && !read_screen_body(server, fd, body_len)) break;
+        if (info.opcode != 0U && info.opcode != 1U) {
+            ++ignored_messages;
+            if (ignored_messages == 1U || ignored_messages % 256U == 0U) {
+                ESP_LOGI(TAG, "screen_message=ignored opcode=%u body_bytes=%" PRIu32
+                             " count=%" PRIu32,
+                         (unsigned)info.opcode, body_len, ignored_messages);
+            }
+        }
         uint64_t frame_counter_before =
             airplay_screen_stream_frame_counter(server->stream);
         uint8_t *body = server->rx_body != NULL

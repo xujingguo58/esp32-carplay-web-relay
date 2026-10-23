@@ -133,7 +133,7 @@ const page = runInNewContext(`${scriptMatch[1]}; ({connect,offer,currentPeer:()=
   } },
   location: { protocol: 'http:', host: '192.168.4.1' },
   WebSocket: MockWebSocket,
-  RTCPeerConnection: MockPeer,
+  window: { RTCPeerConnection: MockPeer },
   Date: { now: () => now },
   setTimeout(callback, delay) { const id = nextTimer++; timeouts.set(id, { callback, delay }); return id; },
   clearTimeout(id) { timeouts.delete(id); },
@@ -181,5 +181,37 @@ const retriesBeforePolicyClose = retryCount();
 third.onclose({ code: 1008 });
 assert.equal(retryCount(), retriesBeforePolicyClose, 'capacity rejection must not create a reconnect storm');
 assert.match(nodes.get('#state').textContent, /上限/, 'capacity rejection gives a visible reason');
+
+const unsupportedNodes = new Map();
+const unsupportedSockets = [];
+class UnsupportedWebSocket extends MockWebSocket {
+  constructor(...args) { super(...args); unsupportedSockets.push(this); }
+}
+const unsupportedPage = runInNewContext(scriptMatch[1], {
+  document: { querySelector(selector) {
+    if (!unsupportedNodes.has(selector)) unsupportedNodes.set(selector, {
+      addEventListener() {}, value: '', hidden: false,
+    });
+    return unsupportedNodes.get(selector);
+  } },
+  location: { protocol: 'http:', host: '192.168.4.1' },
+  WebSocket: UnsupportedWebSocket,
+  window: { isSecureContext: false },
+  Date: { now: () => now },
+  setTimeout(callback, delay) { const id = nextTimer++; timeouts.set(id, { callback, delay }); return id; },
+  clearTimeout(id) { timeouts.delete(id); },
+  setInterval(callback, delay) { intervals.push({ callback, delay }); },
+  addEventListener() {},
+  fetch: async () => ({ json: async () => ({}) }),
+});
+assert.equal(unsupportedNodes.get('#pair-submit').disabled, true,
+  'pairing is disabled when the target browser has no WebRTC implementation');
+assert.match(unsupportedNodes.get('#pair-hint').textContent, /未提供 RTCPeerConnection/,
+  'unsupported browsers get an actionable explanation before allocating ESP32 media resources');
+const unsupportedSocket = unsupportedSockets.at(-1);
+unsupportedSocket.readyState = MockWebSocket.OPEN;
+unsupportedSocket.onopen();
+assert.match(unsupportedNodes.get('#state').textContent, /不支持 WebRTC/,
+  'unsupported browser state remains visible after signaling connects');
 
 process.stdout.write('embedded web JS syntax, DTLS role, touch rectangle, reconnect races and heartbeat tests passed\n');

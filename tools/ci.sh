@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-build_dir="$PWD/build"
+build_dir="$PWD/build-ci"
 mkdir -p "$build_dir"
 sdkconfig_path="$build_dir/sdkconfig.ci"
 : > "$sdkconfig_path"

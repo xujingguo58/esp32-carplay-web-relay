@@ -247,6 +247,20 @@ int main(void)
     assert(s_media_capture.arrival_time_us == 12345U);
     assert(memcmp(body, expected_annex_b, sizeof(expected_annex_b)) == 0);
 
+    /* A non-video message between sealed frames must preserve framing and
+     * nonce sequencing, including the zero-body message seen on iPhone. */
+    memset(header, 0, sizeof(header));
+    header[4] = 7U;
+    assert(airplay_screen_stream_process(stream, header, NULL, 0U, 0U, 20000U) == ESP_OK);
+    put_le32(header, 4U);
+    assert(airplay_screen_stream_process(stream, header, body, 4U, 0U, 21000U) == ESP_OK);
+    assert(airplay_screen_stream_frame_counter(stream) == 1U);
+    assert(airplay_screen_stream_auth_failures(stream) == 0U);
+    assert(capture.calls == 2U && s_media_capture.frame_calls == 1U);
+    put_le32(header, (uint32_t)sizeof(body_storage));
+    assert(airplay_screen_stream_process(stream, header, body, sizeof(body_storage),
+                                         0U, 22000U) == ESP_ERR_INVALID_SIZE);
+
     body_len = encrypt_frame(key, 1U, plaintext, sizeof(plaintext), header, body);
     body[body_len - 1U] ^= 0x80U;
     assert(airplay_screen_stream_process(stream, header, body, body_len,

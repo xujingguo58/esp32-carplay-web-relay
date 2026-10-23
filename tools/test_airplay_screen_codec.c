@@ -30,7 +30,12 @@ int main(void)
     assert(info.sender_time_ns == UINT64_C(2500000000));
     assert(!airplay_screen_parse_header(header, 4, &info));
     header[4] = 7;
-    assert(!airplay_screen_parse_header(header, 5, &info));
+    assert(airplay_screen_parse_header(header, 5, &info));
+    assert(info.opcode == 7U);
+    put_le32(header, 0U);
+    assert(airplay_screen_parse_header(header, 0U, &info));
+    assert(info.opcode == 7U && info.body_bytes == 0U);
+    assert(!airplay_screen_parse_header(header, 1U, &info));
 
     uint8_t frame[] = {0, 0, 0, 2, 0x65, 0xaa, 0, 0, 0, 1, 0x41};
     assert(airplay_screen_convert_length_prefixed_to_annex_b(frame, sizeof(frame)));

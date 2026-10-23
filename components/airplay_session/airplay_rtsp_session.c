@@ -42,6 +42,7 @@ struct airplay_rtsp_session {
     bool has_info;
     bool event_started;
     bool timing_started;
+    bool initial_setup_complete;
     bool screen_started;
     bool record_active;
     bool control_cipher_active;
@@ -286,6 +287,7 @@ static airplay_rtsp_session_result_t handle_teardown(
     session->screen_started = false;
     session->event_started = false;
     session->timing_started = false;
+    session->initial_setup_complete = false;
     session->record_active = false;
     session->screen_port = 0U;
     session->event_port = 0U;
@@ -414,6 +416,7 @@ static airplay_rtsp_session_result_t handle_setup(
                                 AIRPLAY_PLIST_CONTENT_TYPE, body, body_len,
                                 response, response_capacity, response_len);
         if (result == AIRPLAY_RTSP_SESSION_OK) {
+            session->initial_setup_complete = true;
             ESP_LOGI(TAG, "setup=initial timing_port=%u event_port=%u enabled_features=iAPChannel,viewAreas",
                      (unsigned)session->timing_port, (unsigned)session->event_port);
         }
@@ -731,18 +734,25 @@ airplay_rtsp_session_result_t airplay_rtsp_session_handle(
                             response_len);
     }
     if (strcmp(request->method, "RECORD") == 0) {
-        if (!session->screen_started) {
-            ESP_LOGW(TAG, "record=rejected reason=screen_not_setup");
+        /* Like DiPlay, accept session activation before the later Screen
+         * SETUP. RECORD acknowledges the transport session, not video receipt. */
+        if (!session->initial_setup_complete && !session->screen_started) {
+            ESP_LOGW(TAG, "record=rejected reason=session_not_setup");
             return status_response(request,
                                    AIRPLAY_RTSP_STATUS_SESSION_NOT_READY,
                                    "Service Unavailable", response,
                                    response_capacity, response_len);
         }
-        session->record_active = true;
-        ESP_LOGI(TAG, "record=accepted screen_port=%u",
-                 (unsigned)session->screen_port);
-        return status_response(request, AIRPLAY_RTSP_STATUS_OK, "OK",
-                               response, response_capacity, response_len);
+        airplay_rtsp_session_result_t result = status_response(
+            request, AIRPLAY_RTSP_STATUS_OK, "OK", response,
+            response_capacity, response_len);
+        if (result == AIRPLAY_RTSP_SESSION_OK) {
+            session->record_active = true;
+            ESP_LOGI(TAG, "record=accepted phase=%s screen_port=%u",
+                     session->screen_started ? "screen_ready" : "awaiting_screen_setup",
+                     (unsigned)session->screen_port);
+        }
+        return result;
     }
     if (strcmp(request->method, "TEARDOWN") == 0) {
         return handle_teardown(session, request, response,

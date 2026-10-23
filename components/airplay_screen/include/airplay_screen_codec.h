@@ -13,6 +13,7 @@ typedef struct {
     uint64_t sender_time_ns;
 } airplay_screen_header_info_t;
 
+/* Validates framing, including messages with opcodes the media decoder ignores. */
 bool airplay_screen_parse_header(const uint8_t header[AIRPLAY_SCREEN_HEADER_BYTES],
                                  size_t received_body_bytes,
                                  airplay_screen_header_info_t *out_info);

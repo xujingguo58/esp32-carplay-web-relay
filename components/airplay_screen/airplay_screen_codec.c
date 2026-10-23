@@ -5,8 +5,6 @@
 
 #define AIRPLAY_SCREEN_OPCODE_OFFSET 4U
 #define AIRPLAY_SCREEN_SENDER_TIME_OFFSET 8U
-#define AIRPLAY_SCREEN_OPCODE_FRAME 0U
-#define AIRPLAY_SCREEN_OPCODE_CONFIG 1U
 
 static uint32_t read_le32(const uint8_t *bytes)
 {
@@ -45,8 +43,7 @@ bool airplay_screen_parse_header(const uint8_t header[AIRPLAY_SCREEN_HEADER_BYTE
     }
     uint32_t body_bytes = read_le32(header);
     uint8_t opcode = header[AIRPLAY_SCREEN_OPCODE_OFFSET];
-    if (body_bytes != received_body_bytes ||
-        (opcode != AIRPLAY_SCREEN_OPCODE_FRAME && opcode != AIRPLAY_SCREEN_OPCODE_CONFIG)) {
+    if (body_bytes != received_body_bytes) {
         return false;
     }
 

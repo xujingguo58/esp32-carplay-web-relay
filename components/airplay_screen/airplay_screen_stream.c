@@ -126,6 +126,10 @@ esp_err_t airplay_screen_stream_process(airplay_screen_stream_t *stream,
         return ESP_ERR_INVALID_SIZE;
     }
 
+    /* DiPlay ignores non-video messages after consuming their bounded body.
+     * They must not consume an AEAD video nonce or reach the media callback. */
+    if (info.opcode != 0U && info.opcode != 1U) return ESP_OK;
+
     if (info.opcode == 1U) {
         size_t config_len = 0;
         if (!airplay_screen_extract_avcc_to_annex_b(body, body_len,
