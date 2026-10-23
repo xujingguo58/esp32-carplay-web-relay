@@ -141,25 +141,27 @@ static bool read_fully(airplay_screen_server_t *server, int fd, uint8_t *buffer,
 
 static bool read_screen_body(airplay_screen_server_t *server, int fd, size_t size)
 {
-    uint8_t chunk[AIRPLAY_SCREEN_RX_CHUNK_BYTES];
     size_t offset = 0U;
     while (offset < size && !is_stopping(server)) {
         size_t request = size - offset;
-        if (request > sizeof(chunk)) request = sizeof(chunk);
-        ssize_t received = recv(fd, chunk, request, 0);
+        if (request > AIRPLAY_SCREEN_RX_CHUNK_BYTES) {
+            request = AIRPLAY_SCREEN_RX_CHUNK_BYTES;
+        }
+        if (!reserve_rx_body(server, offset + request)) {
+            ESP_LOGW(TAG, "screen_buffer=unavailable kind=receive requested=%u"
+                          " capacity=%u free_internal=%u largest_internal=%u"
+                          " free_psram=%u stack_hwm=%u",
+                     (unsigned)(offset + request),
+                     (unsigned)server->rx_body_capacity,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL));
+            return false;
+        }
+        ssize_t received = recv(fd, server->rx_body + offset, request, 0);
         if (received > 0) {
-            size_t received_bytes = (size_t)received;
-            if (!reserve_rx_body(server, offset + received_bytes)) {
-                ESP_LOGW(TAG, "screen_buffer=unavailable kind=receive requested=%u"
-                              " capacity=%u free_psram=%u stack_hwm=%u",
-                         (unsigned)(offset + received_bytes),
-                         (unsigned)server->rx_body_capacity,
-                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
-                         (unsigned)uxTaskGetStackHighWaterMark(NULL));
-                return false;
-            }
-            memcpy(server->rx_body + offset, chunk, received_bytes);
-            offset += received_bytes;
+            offset += (size_t)received;
             continue;
         }
         if (received == 0) return false;
@@ -184,8 +186,6 @@ static void handle_client(airplay_screen_server_t *server, int fd)
         }
         size_t old_rx_capacity = server->rx_body_capacity;
         if (body_len != 0U && !read_screen_body(server, fd, body_len)) break;
-        size_t old_plaintext_capacity =
-            airplay_screen_stream_plaintext_capacity(server->stream);
         uint64_t frame_counter_before =
             airplay_screen_stream_frame_counter(server->stream);
         esp_err_t err = airplay_screen_stream_process(server->stream, header,
@@ -193,20 +193,22 @@ static void handle_client(airplay_screen_server_t *server, int fd)
                                                       (uint64_t)time_port_monotonic_us());
         uint64_t frame_counter_after =
             airplay_screen_stream_frame_counter(server->stream);
-        size_t plaintext_capacity =
-            airplay_screen_stream_plaintext_capacity(server->stream);
         if (body_len > server->max_body_observed ||
-            server->rx_body_capacity != old_rx_capacity ||
-            plaintext_capacity != old_plaintext_capacity) {
+            server->rx_body_capacity != old_rx_capacity) {
             if (body_len > server->max_body_observed) {
                 server->max_body_observed = body_len;
             }
-            ESP_LOGI(TAG, "screen_buffers=high_water body=%u rx=%u plaintext=%u"
-                          " free_internal=%u free_psram=%u stack_hwm=%u",
+            const char *rx_memory =
+                server->rx_body_caps == (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+                    ? "psram" : "internal";
+            ESP_LOGI(TAG, "screen_buffers=high_water body=%u rx=%u rx_memory=%s"
+                          " decrypt=in_place free_internal=%u largest_internal=%u"
+                          " free_psram=%u stack_hwm=%u",
                      (unsigned)server->max_body_observed,
                      (unsigned)server->rx_body_capacity,
-                     (unsigned)plaintext_capacity,
+                     rx_memory,
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
                      (unsigned)uxTaskGetStackHighWaterMark(NULL));
         }
@@ -219,7 +221,7 @@ static void handle_client(airplay_screen_server_t *server, int fd)
                  frame_counter_after == frame_counter_before)) {
                 ESP_LOGW(TAG, "screen_peer=closing reason=%s",
                          err == ESP_ERR_INVALID_MAC ? "frame_authentication_failed"
-                                                    : "decrypt_buffer_unavailable");
+                                                    : "receive_buffer_unavailable");
                 break;
             }
         }

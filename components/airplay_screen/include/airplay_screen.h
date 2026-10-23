@@ -41,12 +41,14 @@ esp_err_t airplay_screen_derive_output_key(const uint8_t *shared_secret,
                                            size_t shared_secret_len,
                                            uint64_t stream_connection_id,
                                            uint8_t output_key[AIRPLAY_SCREEN_KEY_BYTES]);
+/* Video bodies are decrypted and converted to Annex-B in place. The caller
+ * must provide a writable buffer; on authentication failure the ciphertext
+ * region may be zeroized by Mbed TLS. */
 esp_err_t airplay_screen_stream_process(airplay_screen_stream_t *stream,
                                        const uint8_t header[AIRPLAY_SCREEN_HEADER_BYTES],
-                                       const uint8_t *body,
+                                       uint8_t *body,
                                        size_t body_len,
                                        uint64_t arrival_time_us);
 uint64_t airplay_screen_stream_frame_counter(const airplay_screen_stream_t *stream);
 uint32_t airplay_screen_stream_auth_failures(const airplay_screen_stream_t *stream);
-size_t airplay_screen_stream_plaintext_capacity(const airplay_screen_stream_t *stream);
 bool airplay_screen_crypto_self_test(void);

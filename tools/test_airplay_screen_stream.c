@@ -200,11 +200,12 @@ int main(void)
     airplay_screen_stream_t *stream = airplay_screen_stream_create(
         key, sizeof(body), capture_message, &capture);
     assert(stream != NULL);
-    assert(airplay_screen_stream_plaintext_capacity(stream) == 0U);
 
     make_config_header(sizeof(avcc), header);
-    assert(airplay_screen_stream_process(stream, header, avcc, sizeof(avcc), 11111U) == ESP_OK);
-    assert(airplay_screen_stream_plaintext_capacity(stream) == 0U);
+    uint8_t avcc_body[sizeof(avcc)];
+    memcpy(avcc_body, avcc, sizeof(avcc));
+    assert(airplay_screen_stream_process(stream, header, avcc_body,
+                                         sizeof(avcc_body), 11111U) == ESP_OK);
     assert(capture.calls == 1U && capture.type == AIRPLAY_SCREEN_MESSAGE_CONFIG_H264);
     assert(capture.len == sizeof(expected_config));
     assert(memcmp(capture.bytes, expected_config, sizeof(expected_config)) == 0);
@@ -227,7 +228,7 @@ int main(void)
     assert(memcmp(s_media_capture.frame, expected_annex_b, sizeof(expected_annex_b)) == 0);
     assert(s_media_capture.sender_time_ns == UINT64_C(2500000000));
     assert(s_media_capture.arrival_time_us == 12345U);
-    assert(airplay_screen_stream_plaintext_capacity(stream) == sizeof(plaintext));
+    assert(memcmp(body, expected_annex_b, sizeof(expected_annex_b)) == 0);
 
     body_len = encrypt_frame(key, 1U, plaintext, sizeof(plaintext), header, body);
     body[body_len - 1U] ^= 0x80U;
@@ -249,29 +250,27 @@ int main(void)
     airplay_screen_stream_destroy(stream);
 
     const size_t large_plaintext_len = 600U * 1024U;
-    uint8_t *large_plaintext = malloc(large_plaintext_len);
     uint8_t *large_body = malloc(large_plaintext_len + AIRPLAY_SCREEN_TAG_BYTES);
-    assert(large_plaintext != NULL && large_body != NULL);
-    put_be32(large_plaintext, (uint32_t)(large_plaintext_len - 4U));
-    large_plaintext[4] = 0x65U;
-    memset(large_plaintext + 5U, 0x55, large_plaintext_len - 5U);
+    assert(large_body != NULL);
+    put_be32(large_body, (uint32_t)(large_plaintext_len - 4U));
+    large_body[4] = 0x65U;
+    memset(large_body + 5U, 0x55, large_plaintext_len - 5U);
     uint32_t large_frame_calls = 0U;
     airplay_screen_stream_t *large_stream = airplay_screen_stream_create(
         key, AIRPLAY_SCREEN_SERVER_MAX_BODY_BYTES, discard_large_message,
         &large_frame_calls);
     assert(large_stream != NULL);
-    assert(airplay_screen_stream_plaintext_capacity(large_stream) == 0U);
-    body_len = encrypt_frame(key, 0U, large_plaintext, large_plaintext_len,
+    body_len = encrypt_frame(key, 0U, large_body, large_plaintext_len,
                              header, large_body);
     assert(body_len <= AIRPLAY_SCREEN_SERVER_MAX_BODY_BYTES);
     assert(airplay_screen_stream_process(large_stream, header, large_body,
                                          body_len, 45678U) == ESP_OK);
     assert(large_frame_calls == 1U);
     assert(airplay_screen_stream_frame_counter(large_stream) == 1U);
-    assert(airplay_screen_stream_plaintext_capacity(large_stream) == large_plaintext_len);
+    static const uint8_t annex_b_start_code[] = {0U, 0U, 0U, 1U};
+    assert(memcmp(large_body, annex_b_start_code, sizeof(annex_b_start_code)) == 0);
     airplay_screen_stream_destroy(large_stream);
     free(large_body);
-    free(large_plaintext);
 
     puts("airplay screen stream host test passed");
     return 0;

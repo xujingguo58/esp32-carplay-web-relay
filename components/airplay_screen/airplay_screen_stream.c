@@ -11,7 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "esp_heap_caps.h"
 #include "mbedtls/chachapoly.h"
 #include "mbedtls/hkdf.h"
 #include "mbedtls/md.h"
@@ -25,9 +24,6 @@
 
 struct airplay_screen_stream {
     uint8_t key[AIRPLAY_SCREEN_KEY_BYTES];
-    uint8_t *plaintext;
-    size_t plaintext_capacity;
-    uint32_t plaintext_caps;
     size_t max_body_bytes;
     uint64_t frame_counter;
     uint32_t auth_failures;
@@ -44,49 +40,6 @@ static void make_nonce(uint64_t counter, uint8_t nonce[12])
     for (size_t i = 0; i < 8; ++i) {
         nonce[4U + i] = (uint8_t)(counter >> (8U * i));
     }
-}
-
-static bool reserve_plaintext(airplay_screen_stream_t *stream, size_t required)
-{
-    if (required <= stream->plaintext_capacity) return true;
-
-    const uint32_t psram_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
-    const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
-    void *buffer = NULL;
-    uint32_t caps = stream->plaintext_caps;
-
-    if (stream->plaintext != NULL && caps == psram_caps) {
-        buffer = heap_caps_realloc(stream->plaintext, required, psram_caps);
-        caps = psram_caps;
-    }
-    if (buffer == NULL && heap_caps_get_total_size(MALLOC_CAP_SPIRAM) != 0U) {
-        buffer = heap_caps_malloc(required, psram_caps);
-        if (buffer != NULL) {
-            if (stream->plaintext != NULL) {
-                memset(stream->plaintext, 0, stream->plaintext_capacity);
-                heap_caps_free(stream->plaintext);
-            }
-            caps = psram_caps;
-        }
-    }
-    if (buffer == NULL && required <= 64U * 1024U) {
-        if (stream->plaintext != NULL && stream->plaintext_caps == internal_caps) {
-            buffer = heap_caps_realloc(stream->plaintext, required, internal_caps);
-        } else {
-            buffer = heap_caps_malloc(required, internal_caps);
-            if (buffer != NULL && stream->plaintext != NULL) {
-                memset(stream->plaintext, 0, stream->plaintext_capacity);
-                heap_caps_free(stream->plaintext);
-            }
-        }
-        caps = internal_caps;
-    }
-
-    if (buffer == NULL) return false;
-    stream->plaintext = buffer;
-    stream->plaintext_capacity = required;
-    stream->plaintext_caps = caps;
-    return true;
 }
 
 airplay_screen_stream_t *airplay_screen_stream_create(const uint8_t output_key[AIRPLAY_SCREEN_KEY_BYTES],
@@ -118,10 +71,6 @@ void airplay_screen_stream_destroy(airplay_screen_stream_t *stream)
     if (stream == NULL) return;
     mbedtls_chachapoly_free(&stream->cipher);
     memset(stream->key, 0, sizeof(stream->key));
-    if (stream->plaintext != NULL) {
-        memset(stream->plaintext, 0, stream->plaintext_capacity);
-        heap_caps_free(stream->plaintext);
-    }
     free(stream);
 }
 
@@ -164,7 +113,7 @@ esp_err_t airplay_screen_derive_output_key(const uint8_t *shared_secret,
 
 esp_err_t airplay_screen_stream_process(airplay_screen_stream_t *stream,
                                        const uint8_t header[AIRPLAY_SCREEN_HEADER_BYTES],
-                                       const uint8_t *body,
+                                       uint8_t *body,
                                        size_t body_len,
                                        uint64_t arrival_time_us)
 {
@@ -191,23 +140,22 @@ esp_err_t airplay_screen_stream_process(airplay_screen_stream_t *stream,
 
     if (body_len < AIRPLAY_SCREEN_TAG_BYTES) return ESP_ERR_INVALID_SIZE;
     size_t ciphertext_len = body_len - AIRPLAY_SCREEN_TAG_BYTES;
-    if (!reserve_plaintext(stream, ciphertext_len)) return ESP_ERR_NO_MEM;
     uint8_t nonce[12];
     make_nonce(stream->frame_counter, nonce);
     const uint8_t *tag = body + ciphertext_len;
     int result = mbedtls_chachapoly_auth_decrypt(&stream->cipher, ciphertext_len,
                                                 nonce, header, AIRPLAY_SCREEN_HEADER_BYTES,
-                                                tag, body, stream->plaintext);
+                                                tag, body, body);
     if (result != 0) {
         ++stream->auth_failures;
         return ESP_ERR_INVALID_MAC;
     }
     ++stream->frame_counter;
-    if (!airplay_screen_convert_length_prefixed_to_annex_b(stream->plaintext, ciphertext_len)) {
+    if (!airplay_screen_convert_length_prefixed_to_annex_b(body, ciphertext_len)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
     return stream->callback(AIRPLAY_SCREEN_MESSAGE_FRAME_H264,
-                            stream->plaintext, ciphertext_len,
+                            body, ciphertext_len,
                             info.sender_time_ns, arrival_time_us, stream->context);
 }
 
@@ -219,11 +167,6 @@ uint64_t airplay_screen_stream_frame_counter(const airplay_screen_stream_t *stre
 uint32_t airplay_screen_stream_auth_failures(const airplay_screen_stream_t *stream)
 {
     return stream != NULL ? stream->auth_failures : 0;
-}
-
-size_t airplay_screen_stream_plaintext_capacity(const airplay_screen_stream_t *stream)
-{
-    return stream != NULL ? stream->plaintext_capacity : 0U;
 }
 
 bool airplay_screen_crypto_self_test(void)
@@ -250,14 +193,18 @@ bool airplay_screen_crypto_self_test(void)
     if (mbedtls_chachapoly_setkey(&cipher, key) == 0 &&
         mbedtls_chachapoly_encrypt_and_tag(&cipher, sizeof(plaintext), nonce,
                                            aad, sizeof(aad), plaintext,
-                                           ciphertext, tag) == 0 &&
-        mbedtls_chachapoly_auth_decrypt(&cipher, sizeof(ciphertext), nonce,
-                                       aad, sizeof(aad), tag,
-                                       ciphertext, recovered) == 0 &&
-        memcmp(plaintext, recovered, sizeof(plaintext)) == 0 &&
-        airplay_screen_derive_output_key(hkdf_ikm, sizeof(hkdf_ikm), 7, derived) == ESP_OK &&
-        memcmp(derived, hkdf_expected, sizeof(hkdf_expected)) == 0) {
-        ok = true;
+                                           ciphertext, tag) == 0) {
+        /* ESP-IDF 5.5.3's bundled Mbed TLS supports exact in-place XOR. */
+        memcpy(recovered, ciphertext, sizeof(ciphertext));
+        if (mbedtls_chachapoly_auth_decrypt(&cipher, sizeof(ciphertext), nonce,
+                                            aad, sizeof(aad), tag,
+                                            recovered, recovered) == 0 &&
+            memcmp(plaintext, recovered, sizeof(plaintext)) == 0 &&
+            airplay_screen_derive_output_key(hkdf_ikm, sizeof(hkdf_ikm),
+                                             7, derived) == ESP_OK &&
+            memcmp(derived, hkdf_expected, sizeof(hkdf_expected)) == 0) {
+            ok = true;
+        }
     }
     mbedtls_chachapoly_free(&cipher);
     memset(key, 0, sizeof(key));
