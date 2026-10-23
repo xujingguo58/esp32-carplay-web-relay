@@ -109,6 +109,8 @@ Event listener 的非预期退出会将当前 Event 通道标为失败并禁用�
 
 `media_bridge` 的 AirPlay 输入在提交 H.264 帧时登记一个活动生产者。WebRTC 任务停止时先关闭提交入口，等待活动生产者离开，再销毁队列和动态帧缓冲，避免浏览器断连与 Screen DataStream 接收并发时访问已释放的队列或缓冲。`media_keyframe_gate` 在启动、参数集变更、PLI、断连或任意媒体帧丢失后等待 IDR；只有 IDR 成功提交给 `esp_peer` 后才恢复发送依赖帧。实际帧丢失或发送失败时，桥接会向在线 iPhone 请求新的 IDR；浏览器触发 WebRTC PLI 时也会发送 DiPlay `forceKeyFrame` 主屏命令。命令通过加密 AirPlay Event 连接发送，并按会话限频 250 ms；`test_airplay_control_cipher_host.sh` 解密并验证 RTSP 方法、CSeq、无 stream ID、plist 内容和限频行为，`test_touch_hid_bridge_host.sh` 另验证固定 plist 编码。`tools/test_media_frame_gate_host.sh` 用 ASan/UBSan 与 pthread 交错执行活动提交和停止，并检查丢帧后的关键帧恢复策略：停止关闭入口、后续提交被拒绝、已有提交离开后才报告排空；丢失引用帧后 P 帧被丢弃，直到 IDR 成功发送。该主机测试验证同步和恢复状态策略，不替代 ESP32/FreeRTOS 压力实测或浏览器解码验证。
 
+WebRTC answer SDP 的单槽队列只保存缓冲指针和长度；SDP 本体单独申请 PSRAM，失败时回退内部堆，发送完成或队列清理时擦除并释放。此前队列项和 `webrtc_peer` 任务局部变量各内嵌 3 KiB SDP 数组；新路径去掉内部队列中的大块常驻数据及任务中的固定 SDP 数组，降低 WebRTC 建连时的内部堆压力和任务栈峰值。任务仍保留 16 KiB 内部栈：历史实测曾发生 `webrtc_peer` 栈溢出，后续需在设备完成 ICE/DTLS 和实际媒体收发后依据 high-water 数据再决定缩栈；当前日志快照不能证明新配置的运行时余量。
+
 首版只承诺 H.264。WheelPlay 支持 HEVC，但 Espressif `esp_peer` 公开接口列出的媒体格式包括 H.264、MJPEG 和音频格式，没有把 HEVC 作为本项目首版依赖。[ESP Peer 媒体能力](https://github.com/espressif/esp-webrtc-solution/tree/main/components/esp_peer)
 
 `esp_peer` 发送队列与缓冲池有上限；发送失败会统计丢帧并等待关键帧。接收端到浏览器的 WebRTC packetization、H.264 profile/level 和参数集兼容性需要实机验证。

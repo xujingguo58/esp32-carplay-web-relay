@@ -13,6 +13,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "mbedtls/platform_util.h"
 
 #ifndef CONFIG_CARPLAY_WEBRTC_TEST_STREAM
 #define CONFIG_CARPLAY_WEBRTC_TEST_STREAM 0
@@ -31,8 +32,18 @@
 static const char *TAG = "media_bridge";
 
 typedef struct {
-    char sdp[MEDIA_BRIDGE_SDP_MAX_BYTES];
+    char *sdp;
+    size_t size;
 } answer_command_t;
+
+static void release_answer_command(answer_command_t *answer)
+{
+    if (answer == NULL || answer->sdp == NULL) return;
+    mbedtls_platform_zeroize(answer->sdp, answer->size + 1U);
+    heap_caps_free(answer->sdp);
+    answer->sdp = NULL;
+    answer->size = 0U;
+}
 
 typedef struct {
     size_t size;
@@ -233,7 +244,13 @@ static void delete_media_queues(void)
     QueueHandle_t live_frame_queue = s_live_frame_queue;
     s_live_frame_queue = NULL;
     portEXIT_CRITICAL(&s_live_mux);
-    if (answer_queue != NULL) vQueueDelete(answer_queue);
+    if (answer_queue != NULL) {
+        answer_command_t pending_answer;
+        while (xQueueReceive(answer_queue, &pending_answer, 0) == pdTRUE) {
+            release_answer_command(&pending_answer);
+        }
+        vQueueDelete(answer_queue);
+    }
     if (live_frame_queue != NULL) vQueueDelete(live_frame_queue);
 }
 
@@ -465,18 +482,19 @@ static void media_bridge_task(void *argument)
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
     while (!s_stop_requested) {
-        answer_command_t answer;
+        answer_command_t answer = {0};
         if (xQueueReceive(s_answer_queue, &answer, 0) == pdTRUE) {
             esp_peer_msg_t message = {
                 .type = ESP_PEER_MSG_TYPE_SDP,
                 .data = (uint8_t *)answer.sdp,
-                .size = (int)strlen(answer.sdp),
+                .size = (int)answer.size,
             };
             int result = esp_peer_send_msg(s_peer, &message);
             ESP_LOGI(TAG, "remote_sdp=applied result=%d bytes=%d", result, message.size);
             if (result != ESP_PEER_ERR_NONE && s_signal_cb != NULL) {
                 s_signal_cb("error", "remote SDP rejected", s_signal_context);
             }
+            release_answer_command(&answer);
         }
 
         int result = esp_peer_main_loop(s_peer);
@@ -676,11 +694,35 @@ esp_err_t media_bridge_handle_answer(const char *sdp, size_t sdp_len)
     }
 
     answer_command_t answer = {0};
+    answer.sdp = heap_caps_malloc(sdp_len + 1U,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const char *memory = "psram";
+    if (answer.sdp == NULL) {
+        answer.sdp = heap_caps_malloc(sdp_len + 1U,
+                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        memory = "internal";
+    }
+    if (answer.sdp == NULL) {
+        ESP_LOGW(TAG, "remote_sdp=allocation_failed bytes=%u free_internal=%u free_psram=%u",
+                 (unsigned)sdp_len,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        return ESP_ERR_NO_MEM;
+    }
     memcpy(answer.sdp, sdp, sdp_len);
     answer.sdp[sdp_len] = '\0';
-    if (xQueueOverwrite(s_answer_queue, &answer) != pdPASS) {
-        return ESP_FAIL;
+    answer.size = sdp_len;
+    answer_command_t replaced_answer = {0};
+    bool replaced_pending =
+        xQueueReceive(s_answer_queue, &replaced_answer, 0) == pdTRUE;
+    release_answer_command(&replaced_answer);
+    if (xQueueSend(s_answer_queue, &answer, 0) != pdPASS) {
+        release_answer_command(&answer);
+        ESP_LOGW(TAG, "remote_sdp=queue_full bytes=%u", (unsigned)sdp_len);
+        return ESP_ERR_TIMEOUT;
     }
+    ESP_LOGI(TAG, "remote_sdp=queued bytes=%u memory=%s replaced_pending=%u",
+             (unsigned)sdp_len, memory, replaced_pending ? 1U : 0U);
     return ESP_OK;
 }
 
