@@ -16,6 +16,7 @@ cmake -S "$IDF_PATH/components/mbedtls/mbedtls" -B "$tmp_build/mbedtls" \
 cmake --build "$tmp_build/mbedtls" --target mbedcrypto --parallel 4
 
 clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+    -I"$repo_root/tools/test_support/airplay_rtsp_session_host_stubs" \
     -I"$repo_root/components/airplay_pairing/include" \
     -I"$repo_root/components/airplay_rtsp/include" \
     -I"$repo_root/components/airplay_session/include" \
@@ -29,6 +30,7 @@ clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
     "$repo_root/components/airplay_rtsp/airplay_rtsp_pairing.c" \
     "$repo_root/components/airplay_rtsp/airplay_bplist.c" \
     "$repo_root/components/airplay_session/airplay_rtsp_session.c" \
+    "$repo_root/tools/test_support/airplay_rtsp_session_host_stubs/airplay_mfi_sap_stub.c" \
     "$repo_root/tools/test_airplay_rtsp_session.c" \
     "$tmp_build/mbedtls/library/libmbedcrypto.a" \
     -o "$tmp_build/test_airplay_rtsp_session"

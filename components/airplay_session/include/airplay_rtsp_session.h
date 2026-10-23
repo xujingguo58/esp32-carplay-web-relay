@@ -53,6 +53,12 @@ airplay_rtsp_session_result_t airplay_rtsp_session_create(
     const airplay_rtsp_session_config_t *config,
     airplay_rtsp_session_t **out_session);
 
+/* Creates a session that borrows config->info_plist. The bytes must remain
+ * immutable and valid until airplay_rtsp_session_destroy(). */
+airplay_rtsp_session_result_t airplay_rtsp_session_create_borrowing_info_plist(
+    const airplay_rtsp_session_config_t *config,
+    airplay_rtsp_session_t **out_session);
+
 /* Handles one parsed RTSP request and writes one complete response. The caller
  * must send the response before switching the RTSP socket to ControlCipher. */
 airplay_rtsp_session_result_t airplay_rtsp_session_handle(

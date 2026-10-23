@@ -2,28 +2,39 @@
 #include "airplay_event_port.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "airplay_control_port.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
-#include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "lwip/tcp.h"
 #include "mbedtls/platform_util.h"
 #include "net_port.h"
 
-#define EVENT_TASK_STACK_BYTES 4096U
-#define EVENT_TASK_PRIORITY 5U
 #define EVENT_RX_CHUNK_BYTES 1200U
-#define EVENT_POLL_TIMEOUT_MS 250U
 
 static const char *TAG = "airplay_event";
+
+struct airplay_event_port {
+    int listener_fd;
+    int client_fd;
+    uint16_t port;
+    bool attached;
+    bool connected_notified;
+    bool failed;
+    bool state_in_psram;
+    airplay_pair_verify_event_keys_t keys;
+    uint32_t stream_id;
+    uint32_t initial_cseq;
+    airplay_event_port_state_cb_t on_state;
+    void *context;
+    uint8_t rx[EVENT_RX_CHUNK_BYTES];
+};
 
 static void log_alloc_failure(const char *stage)
 {
@@ -35,19 +46,56 @@ static void log_alloc_failure(const char *stage)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 }
 
-struct airplay_event_port {
-    int listener_fd;
-    int client_fd;
-    uint16_t port;
-    volatile bool stop_requested;
-    TaskHandle_t task;
-    SemaphoreHandle_t stopped;
-    airplay_pair_verify_event_keys_t keys;
-    uint32_t stream_id;
-    uint32_t initial_cseq;
-    airplay_event_port_state_cb_t on_state;
-    void *context;
-};
+static void *event_calloc(size_t size, bool *allocated_in_psram)
+{
+    if (allocated_in_psram != NULL) *allocated_in_psram = false;
+    void *memory = heap_caps_calloc(1U, size,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (memory != NULL) {
+        if (allocated_in_psram != NULL) *allocated_in_psram = true;
+        return memory;
+    }
+    return heap_caps_calloc(1U, size,
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+static void close_socket(int *fd)
+{
+    if (fd == NULL || *fd < 0) return;
+    shutdown(*fd, SHUT_RDWR);
+    close(*fd);
+    *fd = -1;
+}
+
+static bool set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+static void notify_state(airplay_event_port_t *port, bool connected)
+{
+    if (port == NULL) return;
+    port->connected_notified = connected;
+    if (port->on_state != NULL) port->on_state(connected, port->context);
+}
+
+static void fail_event_port(airplay_event_port_t *port, const char *reason)
+{
+    if (port == NULL || port->failed) return;
+    ESP_LOGW(TAG, "event_connection=failed reason=%s", reason);
+    if (port->attached) {
+        airplay_control_port_detach();
+        port->attached = false;
+    }
+    mbedtls_platform_zeroize(&port->keys, sizeof(port->keys));
+    close_socket(&port->client_fd);
+    close_socket(&port->listener_fd);
+    port->failed = true;
+    /* A failed listener/connection is reported so the session can prevent
+     * unsafe event-key reuse after its sequence counters have been consumed. */
+    notify_state(port, false);
+}
 
 static bool socket_write(const uint8_t *bytes, size_t len, void *context)
 {
@@ -61,116 +109,6 @@ static bool socket_write(const uint8_t *bytes, size_t len, void *context)
         offset += (size_t)sent;
     }
     return true;
-}
-
-static bool wait_for_connection(int listener_fd, volatile bool *stop_requested)
-{
-    while (!*stop_requested) {
-        fd_set read_fds;
-        FD_ZERO(&read_fds);
-        FD_SET(listener_fd, &read_fds);
-        struct timeval timeout = {
-            .tv_sec = EVENT_POLL_TIMEOUT_MS / 1000U,
-            .tv_usec = (EVENT_POLL_TIMEOUT_MS % 1000U) * 1000U,
-        };
-        int result = select(listener_fd + 1, &read_fds, NULL, NULL, &timeout);
-        if (result < 0 && errno == EINTR) continue;
-        if (result < 0) return false;
-        if (result == 0) continue;
-        if (FD_ISSET(listener_fd, &read_fds)) return true;
-    }
-    return false;
-}
-
-static void event_task(void *argument)
-{
-    airplay_event_port_t *port = argument;
-    uint8_t rx[EVENT_RX_CHUNK_BYTES];
-    bool attached = false;
-    bool notified_connected = false;
-
-    if (wait_for_connection(port->listener_fd, &port->stop_requested)) {
-        struct sockaddr_in peer_address;
-        socklen_t peer_address_len = sizeof(peer_address);
-        int client_fd = accept(port->listener_fd,
-                               (struct sockaddr *)&peer_address,
-                               &peer_address_len);
-        if (client_fd >= 0 && !port->stop_requested) {
-            port->client_fd = client_fd;
-            int no_delay = 1;
-            (void)setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
-                             &no_delay, sizeof(no_delay));
-            struct timeval timeout = {.tv_sec = 0, .tv_usec = 500000};
-            (void)setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
-                             &timeout, sizeof(timeout));
-            (void)setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,
-                             &timeout, sizeof(timeout));
-
-            attached = airplay_control_port_attach(
-                port->keys.read_key, port->keys.write_key,
-                port->stream_id, port->initial_cseq,
-                socket_write, port) == ESP_OK;
-            mbedtls_platform_zeroize(&port->keys, sizeof(port->keys));
-            if (attached) {
-                ESP_LOGI(TAG, "event_connected peer=%s:%u stream_id=%" PRIu32,
-                         inet_ntoa(peer_address.sin_addr),
-                         (unsigned)ntohs(peer_address.sin_port), port->stream_id);
-                notified_connected = true;
-                if (port->on_state != NULL) port->on_state(true, port->context);
-                while (!port->stop_requested) {
-                    int received = recv(client_fd, rx, sizeof(rx), 0);
-                    if (received < 0 && errno == EINTR) continue;
-                    if (received < 0 &&
-                        (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-                    if (received == 0) {
-                        ESP_LOGW(TAG, "event_connection=peer_closed");
-                        break;
-                    }
-                    if (received < 0) {
-                        ESP_LOGW(TAG, "event_connection=receive_failed errno=%d", errno);
-                        break;
-                    }
-                    esp_err_t receive_result = airplay_control_port_receive_encrypted(
-                        rx, (size_t)received);
-                    if (receive_result != ESP_OK) {
-                        ESP_LOGW(TAG, "event_rx_rejected error=%s",
-                                 esp_err_to_name(receive_result));
-                        break;
-                    }
-                }
-            } else {
-                ESP_LOGE(TAG, "event_control_attach_failed");
-            }
-        } else if (client_fd >= 0) {
-            shutdown(client_fd, SHUT_RDWR);
-            close(client_fd);
-        }
-    }
-
-    if (attached) airplay_control_port_detach();
-    /* Report connected sessions closing and unexpected listener/attach
-     * failures. An intentional stop before connect has no state transition. */
-    if (port->on_state != NULL &&
-        (notified_connected || !port->stop_requested)) {
-        port->on_state(false, port->context);
-    }
-    if (notified_connected) {
-        ESP_LOGI(TAG, "event_disconnected stack_hwm=%u",
-                 (unsigned)uxTaskGetStackHighWaterMark(NULL));
-    }
-    if (port->client_fd >= 0) {
-        shutdown(port->client_fd, SHUT_RDWR);
-        close(port->client_fd);
-        port->client_fd = -1;
-    }
-    if (port->listener_fd >= 0) {
-        close(port->listener_fd);
-        port->listener_fd = -1;
-    }
-    mbedtls_platform_zeroize(rx, sizeof(rx));
-    mbedtls_platform_zeroize(&port->keys, sizeof(port->keys));
-    (void)xSemaphoreGive(port->stopped);
-    vTaskDelete(NULL);
 }
 
 esp_err_t airplay_event_port_start(const airplay_event_port_config_t *config,
@@ -191,6 +129,12 @@ esp_err_t airplay_event_port_start(const airplay_event_port_config_t *config,
                  errno,
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        return ESP_FAIL;
+    }
+    if (!set_nonblocking(listener_fd)) {
+        int socket_errno = errno;
+        close(listener_fd);
+        ESP_LOGE(TAG, "event_listener=nonblocking_failed errno=%d", socket_errno);
         return ESP_FAIL;
     }
     int reuse = 1;
@@ -223,7 +167,7 @@ esp_err_t airplay_event_port_start(const airplay_event_port_config_t *config,
     }
     socklen_t address_len = sizeof(address);
     if (getsockname(listener_fd, (struct sockaddr *)&address,
-                    &address_len) != 0 || address.sin_port == 0) {
+                    &address_len) != 0 || address.sin_port == 0U) {
         int socket_errno = errno;
         close(listener_fd);
         ESP_LOGE(TAG, "event_listener=getsockname_failed errno=%d port=%u",
@@ -231,7 +175,8 @@ esp_err_t airplay_event_port_start(const airplay_event_port_config_t *config,
         return ESP_FAIL;
     }
 
-    airplay_event_port_t *port = calloc(1U, sizeof(*port));
+    bool state_in_psram = false;
+    airplay_event_port_t *port = event_calloc(sizeof(*port), &state_in_psram);
     if (port == NULL) {
         close(listener_fd);
         log_alloc_failure("listener_state");
@@ -240,34 +185,17 @@ esp_err_t airplay_event_port_start(const airplay_event_port_config_t *config,
     port->listener_fd = listener_fd;
     port->client_fd = -1;
     port->port = ntohs(address.sin_port);
+    port->state_in_psram = state_in_psram;
     memcpy(&port->keys, &config->keys, sizeof(port->keys));
     port->stream_id = config->stream_id;
     port->initial_cseq = config->initial_cseq;
     port->on_state = config->on_state;
     port->context = config->context;
-    port->stopped = xSemaphoreCreateBinary();
-    if (port->stopped == NULL) {
-        close(listener_fd);
-        mbedtls_platform_zeroize(port, sizeof(*port));
-        free(port);
-        log_alloc_failure("stopped_semaphore");
-        return ESP_ERR_NO_MEM;
-    }
-
-    BaseType_t task_result = xTaskCreate(event_task, "airplay_event",
-                                         EVENT_TASK_STACK_BYTES, port,
-                                         EVENT_TASK_PRIORITY, &port->task);
-    if (task_result != pdPASS) {
-        close(listener_fd);
-        vSemaphoreDelete(port->stopped);
-        mbedtls_platform_zeroize(port, sizeof(*port));
-        free(port);
-        log_alloc_failure("event_task_stack_or_tcb");
-        return ESP_ERR_NO_MEM;
-    }
     *out_port = port;
-    ESP_LOGI(TAG, "event_listener_ready ip=" IPSTR " port=%u free_internal=%u free_psram=%u",
+    ESP_LOGI(TAG, "event_listener=ready ip=" IPSTR " port=%u state_memory=%s state_bytes=%u mode=rtsp_poll free_internal=%u free_psram=%u",
              IP2STR(&ap_ip_info.ip), (unsigned)port->port,
+             port->state_in_psram ? "psram" : "internal",
+             (unsigned)sizeof(*port),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     return ESP_OK;
@@ -278,19 +206,84 @@ uint16_t airplay_event_port_get_port(const airplay_event_port_t *port)
     return port == NULL ? 0U : port->port;
 }
 
+int airplay_event_port_get_poll_fd(const airplay_event_port_t *port)
+{
+    if (port == NULL || port->failed) return -1;
+    if (port->client_fd >= 0) return port->client_fd;
+    return port->listener_fd;
+}
+
+void airplay_event_port_poll(airplay_event_port_t *port)
+{
+    if (port == NULL || port->failed) return;
+
+    if (port->client_fd < 0) {
+        struct sockaddr_in peer_address;
+        socklen_t peer_address_len = sizeof(peer_address);
+        int client_fd = accept(port->listener_fd,
+                               (struct sockaddr *)&peer_address,
+                               &peer_address_len);
+        if (client_fd < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return;
+            fail_event_port(port, "accept");
+            return;
+        }
+        int no_delay = 1;
+        (void)setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
+                         &no_delay, sizeof(no_delay));
+        struct timeval timeout = {.tv_sec = 0, .tv_usec = 500000};
+        (void)setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
+                         &timeout, sizeof(timeout));
+        (void)setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,
+                         &timeout, sizeof(timeout));
+        port->client_fd = client_fd;
+        close_socket(&port->listener_fd);
+        port->attached = airplay_control_port_attach(
+            port->keys.read_key, port->keys.write_key,
+            port->stream_id, port->initial_cseq,
+            socket_write, port) == ESP_OK;
+        mbedtls_platform_zeroize(&port->keys, sizeof(port->keys));
+        if (!port->attached) {
+            fail_event_port(port, "control_attach");
+            return;
+        }
+        ESP_LOGI(TAG, "event_connected peer=%s:%u stream_id=%" PRIu32,
+                 inet_ntoa(peer_address.sin_addr),
+                 (unsigned)ntohs(peer_address.sin_port), port->stream_id);
+        notify_state(port, true);
+        return;
+    }
+
+    int received = recv(port->client_fd, port->rx, sizeof(port->rx), MSG_DONTWAIT);
+    if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) return;
+    if (received == 0) {
+        fail_event_port(port, "peer_closed");
+        return;
+    }
+    if (received < 0) {
+        fail_event_port(port, "receive");
+        return;
+    }
+    esp_err_t receive_result = airplay_control_port_receive_encrypted(
+        port->rx, (size_t)received);
+    if (receive_result != ESP_OK) {
+        ESP_LOGW(TAG, "event_rx_rejected error=%s", esp_err_to_name(receive_result));
+        fail_event_port(port, "encrypted_payload");
+        return;
+    }
+    mbedtls_platform_zeroize(port->rx, (size_t)received);
+}
+
 void airplay_event_port_stop(airplay_event_port_t *port)
 {
     if (port == NULL) return;
-    port->stop_requested = true;
-    if (port->listener_fd >= 0) shutdown(port->listener_fd, SHUT_RDWR);
-    if (port->client_fd >= 0) shutdown(port->client_fd, SHUT_RDWR);
-    if (port->task != NULL && xTaskGetCurrentTaskHandle() == port->task) {
-        return;
+    if (port->attached) {
+        airplay_control_port_detach();
+        port->attached = false;
     }
-    if (port->task != NULL) {
-        (void)xSemaphoreTake(port->stopped, portMAX_DELAY);
-    }
-    vSemaphoreDelete(port->stopped);
+    if (port->connected_notified) notify_state(port, false);
+    close_socket(&port->client_fd);
+    close_socket(&port->listener_fd);
     mbedtls_platform_zeroize(port, sizeof(*port));
-    free(port);
+    heap_caps_free(port);
 }

@@ -45,6 +45,7 @@ typedef struct {
     uint8_t stream[RTSP_SERVER_STREAM_BUFFER_BYTES];
     uint8_t response[RTSP_SERVER_RESPONSE_BYTES];
     uint8_t io[RTSP_SERVER_CIPHER_FRAME_BYTES];
+    uint8_t rx[RTSP_SERVER_RX_CHUNK_BYTES];
     airplay_rtsp_request_t request;
     airplay_control_cipher_t *cipher;
     size_t stream_len;
@@ -52,7 +53,8 @@ typedef struct {
 
 struct airplay_rtsp_server {
     airplay_rtsp_server_config_t config;
-    uint8_t info_plist[AIRPLAY_RTSP_SESSION_INFO_MAX_BYTES];
+    uint8_t *info_plist;
+    bool info_plist_in_psram;
     int listener_fd;
     int client_fd;
     uint16_t port;
@@ -70,19 +72,18 @@ struct airplay_rtsp_server {
 static portMUX_TYPE s_server_mux = portMUX_INITIALIZER_UNLOCKED;
 static airplay_rtsp_server_t *s_server;
 
-static void *server_calloc(size_t count, size_t size)
+static void *server_calloc_at(size_t count, size_t size, bool *allocated_in_psram)
 {
+    if (allocated_in_psram != NULL) *allocated_in_psram = false;
     if (count == 0U || size == 0U || count > SIZE_MAX / size) return NULL;
-    size_t bytes = count * size;
     void *buffer = heap_caps_calloc(count, size,
                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (buffer == NULL) {
-        buffer = heap_caps_calloc(count, size,
-                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (buffer != NULL) {
+        if (allocated_in_psram != NULL) *allocated_in_psram = true;
+        return buffer;
     }
-    if (buffer == NULL) return NULL;
-    memset(buffer, 0, bytes);
-    return buffer;
+    return heap_caps_calloc(count, size,
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
 static void event_state_changed(bool connected, void *context);
@@ -95,6 +96,14 @@ static void server_free(void *buffer, size_t size)
     if (buffer == NULL) return;
     mbedtls_platform_zeroize(buffer, size);
     heap_caps_free(buffer);
+}
+
+static void server_destroy(airplay_rtsp_server_t *server)
+{
+    if (server == NULL) return;
+    server_free(server->info_plist, AIRPLAY_RTSP_SESSION_INFO_MAX_BYTES);
+    mbedtls_platform_zeroize(server, sizeof(*server));
+    free(server);
 }
 
 static bool socket_write_all(int fd, const uint8_t *bytes, size_t len)
@@ -252,7 +261,7 @@ static void event_state_changed(bool connected, void *context)
     } else if (airplay_event_lifecycle_is_unexpected_exit(
                    connected, server->event_stopping,
                    server->stop_requested)) {
-        /* The event task reports false on every unrequested exit, including
+        /* The event poller reports false on every unrequested exit, including
          * listener/attach failures before a successful connection. */
         server->event_failed = true;
         unexpected_exit = true;
@@ -315,7 +324,8 @@ static airplay_rtsp_session_result_t create_session(
         .stop_timing = stop_timing,
         .media_context = server,
     };
-    return airplay_rtsp_session_create(&config, out_session);
+    return airplay_rtsp_session_create_borrowing_info_plist(&config,
+                                                            out_session);
 }
 
 static void consume_stream(rtsp_connection_t *connection, size_t count)
@@ -476,7 +486,9 @@ static void serve_client(airplay_rtsp_server_t *server, int client_fd)
     (void)setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
                      sizeof(timeout));
 
-    rtsp_connection_t *connection = server_calloc(1U, sizeof(*connection));
+    bool connection_in_psram = false;
+    rtsp_connection_t *connection = server_calloc_at(
+        1U, sizeof(*connection), &connection_in_psram);
     airplay_rtsp_session_t *session = NULL;
     portENTER_CRITICAL(&s_server_mux);
     server->event_connected = false;
@@ -494,15 +506,26 @@ static void serve_client(airplay_rtsp_server_t *server, int client_fd)
         return;
     }
 
+    ESP_LOGI(TAG, "rtsp_connection=allocated memory=%s bytes=%u free_internal=%u free_psram=%u",
+             connection_in_psram ? "psram" : "internal",
+             (unsigned)sizeof(*connection),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+
     ESP_LOGI(TAG, "rtsp_client=connected free_internal=%u free_psram=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    uint8_t rx[RTSP_SERVER_RX_CHUNK_BYTES];
     while (!server->stop_requested) {
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(client_fd, &read_fds);
         int max_fd = client_fd;
+        airplay_event_port_t *event_port = server->event_port;
+        int event_fd = airplay_event_port_get_poll_fd(event_port);
+        if (event_fd >= 0) {
+            FD_SET(event_fd, &read_fds);
+            if (event_fd > max_fd) max_fd = event_fd;
+        }
         int timing_fd = airplay_timing_port_get_socket_fd(server->timing_port);
         if (timing_fd >= 0) {
             FD_SET(timing_fd, &read_fds);
@@ -517,11 +540,14 @@ static void serve_client(airplay_rtsp_server_t *server, int client_fd)
         }
 
         bool client_readable = FD_ISSET(client_fd, &read_fds);
+        bool event_readable = event_fd >= 0 && FD_ISSET(event_fd, &read_fds);
         bool timing_readable = timing_fd >= 0 && FD_ISSET(timing_fd, &read_fds);
+        if (event_readable) airplay_event_port_poll(event_port);
         airplay_timing_port_poll(server->timing_port, timing_readable);
         if (!client_readable) continue;
 
-        int received = recv(client_fd, rx, sizeof(rx), 0);
+        int received = recv(client_fd, connection->rx,
+                            sizeof(connection->rx), 0);
         if (received < 0 && errno == EINTR) continue;
         if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         if (received == 0) {
@@ -533,11 +559,10 @@ static void serve_client(airplay_rtsp_server_t *server, int client_fd)
             break;
         }
         if (!process_received_bytes(server, connection, session, client_fd,
-                                    rx, (size_t)received)) {
+                                    connection->rx, (size_t)received)) {
             break;
         }
     }
-    mbedtls_platform_zeroize(rx, sizeof(rx));
     airplay_control_cipher_destroy(connection->cipher);
     airplay_rtsp_session_destroy(session);
     server_free(connection, sizeof(*connection));
@@ -665,6 +690,18 @@ esp_err_t airplay_rtsp_server_start(
         close(listener_fd);
         return ESP_ERR_NO_MEM;
     }
+    server->info_plist = server_calloc_at(
+        1U, AIRPLAY_RTSP_SESSION_INFO_MAX_BYTES,
+        &server->info_plist_in_psram);
+    if (server->info_plist == NULL) {
+        ESP_LOGE(TAG, "rtsp_info_plist=alloc_failed free_internal=%u largest_internal=%u free_psram=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        close(listener_fd);
+        free(server);
+        return ESP_ERR_NO_MEM;
+    }
     server->config = *config;
     memcpy(server->info_plist, config->info_plist, config->info_plist_len);
     server->config.info_plist = server->info_plist;
@@ -674,7 +711,7 @@ esp_err_t airplay_rtsp_server_start(
     server->stopped = xSemaphoreCreateBinary();
     if (server->stopped == NULL) {
         close(listener_fd);
-        free(server);
+        server_destroy(server);
         return ESP_ERR_NO_MEM;
     }
 
@@ -683,8 +720,7 @@ esp_err_t airplay_rtsp_server_start(
         portEXIT_CRITICAL(&s_server_mux);
         close(listener_fd);
         vSemaphoreDelete(server->stopped);
-        mbedtls_platform_zeroize(server, sizeof(*server));
-        free(server);
+        server_destroy(server);
         return ESP_ERR_INVALID_STATE;
     }
     s_server = server;
@@ -697,13 +733,14 @@ esp_err_t airplay_rtsp_server_start(
         portEXIT_CRITICAL(&s_server_mux);
         close(listener_fd);
         vSemaphoreDelete(server->stopped);
-        mbedtls_platform_zeroize(server, sizeof(*server));
-        free(server);
+        server_destroy(server);
         return ESP_ERR_NO_MEM;
     }
     *out_server = server;
-    ESP_LOGI(TAG, "rtsp_listener=ready ip=" IPSTR " port=%u free_internal=%u free_psram=%u",
+    ESP_LOGI(TAG, "rtsp_listener=ready ip=" IPSTR " port=%u plist_memory=%s plist_capacity=%u free_internal=%u free_psram=%u",
              IP2STR(&ap_ip.ip), (unsigned)server->port,
+             server->info_plist_in_psram ? "psram" : "internal",
+             (unsigned)AIRPLAY_RTSP_SESSION_INFO_MAX_BYTES,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     return ESP_OK;
@@ -733,6 +770,5 @@ void airplay_rtsp_server_stop(airplay_rtsp_server_t *server)
     if (s_server == server) s_server = NULL;
     portEXIT_CRITICAL(&s_server_mux);
     vSemaphoreDelete(server->stopped);
-    mbedtls_platform_zeroize(server, sizeof(*server));
-    free(server);
+    server_destroy(server);
 }

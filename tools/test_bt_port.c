@@ -17,9 +17,9 @@ static void state_callback(bool connected, void *context)
 static void simulate_open(uint32_t handle)
 {
     esp_spp_cb_param_t event = {0};
-    event.srv_open.status = ESP_SPP_SUCCESS;
-    event.srv_open.handle = handle;
-    spp_callback(ESP_SPP_SRV_OPEN_EVT, &event);
+    event.open.status = ESP_SPP_SUCCESS;
+    event.open.handle = handle;
+    spp_callback(ESP_SPP_OPEN_EVT, &event);
 }
 
 static void simulate_rx(const uint8_t *data, uint16_t length)
@@ -47,6 +47,7 @@ int main(void)
     esp_spp_cb_param_t init = {0};
     init.init.status = ESP_SPP_SUCCESS;
     spp_callback(ESP_SPP_INIT_EVT, &init);
+    bt_port_set_discovery_enabled(true);
     simulate_open(42U);
     assert(bt_port_is_connected());
     (void)xQueueReset(s_rx_queue); /* Model the dispatcher consuming the OPEN event. */

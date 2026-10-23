@@ -238,11 +238,14 @@ static void test_info_and_setup_gates(void)
     config.pairing.pair_verify.sign_accessory = test_sign;
     config.pairing.pair_verify.verify_controller = test_verify;
     config.pairing.pair_verify.lookup_controller = test_lookup;
-    config.info_plist = k_setup_plist;
+    uint8_t mutable_info_plist[sizeof(k_setup_plist)];
+    memcpy(mutable_info_plist, k_setup_plist, sizeof(mutable_info_plist));
+    config.info_plist = mutable_info_plist;
     config.info_plist_len = sizeof(k_setup_plist);
 
     airplay_rtsp_session_t *session = NULL;
     assert(airplay_rtsp_session_create(&config, &session) == AIRPLAY_RTSP_SESSION_OK);
+    memset(mutable_info_plist, 0, sizeof(mutable_info_plist));
     uint8_t response[AIRPLAY_RTSP_SESSION_RESPONSE_MAX_BYTES];
     size_t response_len = 0U;
     bool enable_cipher = false;
@@ -273,6 +276,18 @@ static void test_info_and_setup_gates(void)
                                        &response_len, &enable_cipher) == AIRPLAY_RTSP_SESSION_OK);
     assert(contains_bytes(response, response_len, "503 Service Unavailable"));
 
+    airplay_rtsp_session_destroy(session);
+
+    memcpy(mutable_info_plist, k_setup_plist, sizeof(mutable_info_plist));
+    config.info_plist = mutable_info_plist;
+    assert(airplay_rtsp_session_create_borrowing_info_plist(
+               &config, &session) == AIRPLAY_RTSP_SESSION_OK);
+    mutable_info_plist[sizeof(mutable_info_plist) - 1U] ^= 1U;
+    request = parse_request("GET /info RTSP/1.0\r\nCSeq: 4\r\n\r\n");
+    assert(airplay_rtsp_session_handle(session, &request, response, sizeof(response),
+                                       &response_len, &enable_cipher) == AIRPLAY_RTSP_SESSION_OK);
+    assert(memcmp(response + response_len - sizeof(mutable_info_plist),
+                  mutable_info_plist, sizeof(mutable_info_plist)) == 0);
     airplay_rtsp_session_destroy(session);
 }
 
@@ -443,13 +458,10 @@ static void test_screen_key_lifecycle(void)
     assert(response_type == AIRPLAY_BPLIST_ARRAY && response_count == 1U);
     assert(ports.screen_starts == 1U && ports.last_screen_connection_id == 12345U);
 
-    request = parse_request("SETUP /stream RTSP/1.0\r\nCSeq: 11\r\n\r\n");
-    request.body = k_setup_plist;
-    request.body_len = sizeof(k_setup_plist);
+    request = parse_request("RECORD /stream RTSP/1.0\r\nCSeq: 11\r\n\r\n");
     assert(airplay_rtsp_session_handle(session, &request, response, sizeof(response),
                                        &response_len, &enable_cipher) == AIRPLAY_RTSP_SESSION_OK);
     assert(contains_bytes(response, response_len, "200 OK"));
-    assert(ports.screen_starts == 1U && ports.last_screen_connection_id == 12345U);
 
     request = parse_request("SETUP /stream RTSP/1.0\r\nCSeq: 12\r\n\r\n");
     request.body = k_setup_plist;
@@ -457,9 +469,17 @@ static void test_screen_key_lifecycle(void)
     assert(airplay_rtsp_session_handle(session, &request, response, sizeof(response),
                                        &response_len, &enable_cipher) == AIRPLAY_RTSP_SESSION_OK);
     assert(contains_bytes(response, response_len, "200 OK"));
+    assert(ports.screen_starts == 1U && ports.last_screen_connection_id == 12345U);
+
+    request = parse_request("SETUP /stream RTSP/1.0\r\nCSeq: 13\r\n\r\n");
+    request.body = k_setup_plist;
+    request.body_len = sizeof(k_setup_plist);
+    assert(airplay_rtsp_session_handle(session, &request, response, sizeof(response),
+                                       &response_len, &enable_cipher) == AIRPLAY_RTSP_SESSION_OK);
+    assert(contains_bytes(response, response_len, "200 OK"));
     assert(ports.screen_starts == 1U && ports.screen_stops == 0U);
 
-    request = parse_request("TEARDOWN /stream RTSP/1.0\r\nCSeq: 13\r\n\r\n");
+    request = parse_request("TEARDOWN /stream RTSP/1.0\r\nCSeq: 14\r\n\r\n");
     request.body = k_unsupported_stream_setup_plist;
     request.body_len = sizeof(k_unsupported_stream_setup_plist);
     assert(airplay_rtsp_session_handle(session, &request, response, sizeof(response),
@@ -468,7 +488,7 @@ static void test_screen_key_lifecycle(void)
     assert(ports.screen_stops == 0U);
     assert(ports.event_stops == 0U && ports.timing_stops == 0U);
 
-    request = parse_request("TEARDOWN /stream RTSP/1.0\r\nCSeq: 14\r\n\r\n");
+    request = parse_request("TEARDOWN /stream RTSP/1.0\r\nCSeq: 15\r\n\r\n");
     request.body = k_setup_plist;
     request.body_len = sizeof(k_setup_plist);
     assert(airplay_rtsp_session_handle(session, &request, response, sizeof(response),
@@ -476,7 +496,7 @@ static void test_screen_key_lifecycle(void)
     assert(ports.screen_stops == 1U);
     assert(ports.event_stops == 0U && ports.timing_stops == 0U);
 
-    request = parse_request("SETUP /stream RTSP/1.0\r\nCSeq: 15\r\n\r\n");
+    request = parse_request("SETUP /stream RTSP/1.0\r\nCSeq: 16\r\n\r\n");
     request.body = k_setup_plist;
     request.body_len = sizeof(k_setup_plist);
     assert(airplay_rtsp_session_handle(session, &request, response, sizeof(response),
@@ -488,7 +508,7 @@ static void test_screen_key_lifecycle(void)
     memcpy(different_key_id_plist, k_setup_plist, sizeof(different_key_id_plist));
     assert(replace_setup_connection_id(different_key_id_plist,
                                       sizeof(different_key_id_plist), 12346U));
-    request = parse_request("SETUP /stream RTSP/1.0\r\nCSeq: 16\r\n\r\n");
+    request = parse_request("SETUP /stream RTSP/1.0\r\nCSeq: 17\r\n\r\n");
     request.body = different_key_id_plist;
     request.body_len = sizeof(different_key_id_plist);
     assert(airplay_rtsp_session_handle(session, &request, response, sizeof(response),
@@ -496,7 +516,7 @@ static void test_screen_key_lifecycle(void)
     assert(contains_bytes(response, response_len, "200 OK"));
     assert(ports.screen_starts == 2U && ports.last_screen_connection_id == 12346U);
 
-    request = parse_request("TEARDOWN /stream RTSP/1.0\r\nCSeq: 17\r\n\r\n");
+    request = parse_request("TEARDOWN /stream RTSP/1.0\r\nCSeq: 18\r\n\r\n");
     assert(airplay_rtsp_session_handle(session, &request, response, sizeof(response),
                                        &response_len, &enable_cipher) == AIRPLAY_RTSP_SESSION_OK);
     assert(ports.screen_stops == 2U);
@@ -512,6 +532,6 @@ int main(void)
     test_info_and_setup_gates();
     test_initial_setup_timing_and_event_ports();
     test_screen_key_lifecycle();
-    puts("airplay RTSP session host test passed (test-only signing provider)");
+    puts("airplay RTSP session host test passed (copy/borrow, RECORD gate, test-only signer)");
     return 0;
 }

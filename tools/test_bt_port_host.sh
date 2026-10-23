@@ -6,7 +6,7 @@ temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/bt-port-host.XXXXXX")
 trap 'rm -rf "$temp_dir"' EXIT
 
 stub_source="$repo_root/tools/test_support/bt_port_host_stubs/bt_port_host_api.h"
-for header in esp_err.h esp_bt.h esp_bt_device.h esp_bt_main.h esp_gap_bt_api.h esp_log.h \
+for header in esp_err.h esp_bt.h esp_bt_device.h esp_bt_main.h esp_gap_bt_api.h esp_log.h esp_timer.h \
               esp_sdp_api.h esp_spp_api.h freertos/FreeRTOS.h \
               freertos/queue.h freertos/task.h; do
     mkdir -p "$temp_dir/$(dirname "$header")"

@@ -12,6 +12,9 @@
 #include "airplay_bplist.h"
 #include "airplay_mfi_sap.h"
 #include "esp_log.h"
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#endif
 #include "mbedtls/platform_util.h"
 
 #define AIRPLAY_PLIST_CONTENT_TYPE "application/x-apple-binary-plist"
@@ -29,7 +32,7 @@ static const char *TAG = "airplay_rtsp_session";
 struct airplay_rtsp_session {
     airplay_rtsp_session_config_t config;
     airplay_rtsp_pairing_t *pairing;
-    uint8_t info_plist[AIRPLAY_RTSP_SESSION_INFO_MAX_BYTES];
+    uint8_t *owned_info_plist;
     uint16_t event_port;
     uint16_t timing_port;
     uint16_t screen_port;
@@ -522,9 +525,43 @@ static airplay_rtsp_session_result_t handle_setup(
     return result;
 }
 
-airplay_rtsp_session_result_t airplay_rtsp_session_create(
+static uint8_t *copy_info_plist(const uint8_t *info_plist,
+                                size_t info_plist_len,
+                                bool *allocated_in_psram)
+{
+    if (allocated_in_psram != NULL) *allocated_in_psram = false;
+    uint8_t *copy = NULL;
+#ifdef ESP_PLATFORM
+    copy = heap_caps_malloc(info_plist_len,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (copy != NULL) {
+        if (allocated_in_psram != NULL) *allocated_in_psram = true;
+    } else {
+        copy = heap_caps_malloc(info_plist_len,
+                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+#else
+    copy = malloc(info_plist_len);
+#endif
+    if (copy != NULL) memcpy(copy, info_plist, info_plist_len);
+    return copy;
+}
+
+static void free_info_plist(uint8_t *info_plist, size_t info_plist_len)
+{
+    if (info_plist == NULL) return;
+    mbedtls_platform_zeroize(info_plist, info_plist_len);
+#ifdef ESP_PLATFORM
+    heap_caps_free(info_plist);
+#else
+    free(info_plist);
+#endif
+}
+
+static airplay_rtsp_session_result_t session_create(
     const airplay_rtsp_session_config_t *config,
-    airplay_rtsp_session_t **out_session)
+    airplay_rtsp_session_t **out_session,
+    bool borrow_info_plist)
 {
     if (out_session == NULL) return AIRPLAY_RTSP_SESSION_INVALID_ARGUMENT;
     *out_session = NULL;
@@ -555,11 +592,41 @@ airplay_rtsp_session_result_t airplay_rtsp_session_create(
                    : AIRPLAY_RTSP_SESSION_INVALID_ARGUMENT;
     }
     session->config = *config;
-    memcpy(session->info_plist, config->info_plist, config->info_plist_len);
-    session->config.info_plist = session->info_plist;
+    if (!borrow_info_plist) {
+        bool allocated_in_psram = false;
+        session->owned_info_plist = copy_info_plist(
+            config->info_plist, config->info_plist_len, &allocated_in_psram);
+        if (session->owned_info_plist == NULL) {
+            airplay_rtsp_pairing_destroy(session->pairing);
+            memset(session, 0, sizeof(*session));
+            free(session);
+            return AIRPLAY_RTSP_SESSION_NO_MEMORY;
+        }
+        session->config.info_plist = session->owned_info_plist;
+        ESP_LOGI(TAG, "info_plist=stored memory=%s bytes=%u",
+                 allocated_in_psram ? "psram" : "internal",
+                 (unsigned)config->info_plist_len);
+    } else {
+        ESP_LOGI(TAG, "info_plist=borrowed bytes=%u",
+                 (unsigned)config->info_plist_len);
+    }
     session->has_info = true;
     *out_session = session;
     return AIRPLAY_RTSP_SESSION_OK;
+}
+
+airplay_rtsp_session_result_t airplay_rtsp_session_create(
+    const airplay_rtsp_session_config_t *config,
+    airplay_rtsp_session_t **out_session)
+{
+    return session_create(config, out_session, false);
+}
+
+airplay_rtsp_session_result_t airplay_rtsp_session_create_borrowing_info_plist(
+    const airplay_rtsp_session_config_t *config,
+    airplay_rtsp_session_t **out_session)
+{
+    return session_create(config, out_session, true);
 }
 
 airplay_rtsp_session_result_t airplay_rtsp_session_handle(
@@ -611,7 +678,8 @@ airplay_rtsp_session_result_t airplay_rtsp_session_handle(
         }
         return build_response(request, AIRPLAY_RTSP_STATUS_OK, "OK",
                               AIRPLAY_PLIST_CONTENT_TYPE,
-                              session->info_plist, session->config.info_plist_len,
+                              session->config.info_plist,
+                              session->config.info_plist_len,
                               response, response_capacity, response_len);
     }
 
@@ -620,9 +688,15 @@ airplay_rtsp_session_result_t airplay_rtsp_session_handle(
                             response_len);
     }
     if (strcmp(request->method, "RECORD") == 0) {
+        if (!session->screen_started) {
+            ESP_LOGW(TAG, "record=rejected reason=screen_not_setup");
+            return status_response(request,
+                                   AIRPLAY_RTSP_STATUS_SESSION_NOT_READY,
+                                   "Service Unavailable", response,
+                                   response_capacity, response_len);
+        }
         session->record_active = true;
-        ESP_LOGI(TAG, "record=accepted screen_started=%u screen_port=%u",
-                 session->screen_started ? 1U : 0U,
+        ESP_LOGI(TAG, "record=accepted screen_port=%u",
                  (unsigned)session->screen_port);
         return status_response(request, AIRPLAY_RTSP_STATUS_OK, "OK",
                                response, response_capacity, response_len);
@@ -669,6 +743,8 @@ void airplay_rtsp_session_destroy(airplay_rtsp_session_t *session)
         session->config.stop_timing(session->config.media_context);
     }
     airplay_rtsp_pairing_destroy(session->pairing);
+    free_info_plist(session->owned_info_plist,
+                    session->config.info_plist_len);
     memset(session, 0, sizeof(*session));
     free(session);
 }

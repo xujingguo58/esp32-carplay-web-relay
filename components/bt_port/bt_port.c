@@ -184,11 +184,11 @@ static void maybe_add_phone_candidate(const esp_bt_gap_cb_param_t *param)
     for (int i = 0; i < param->disc_res.num_prop; ++i) {
         const esp_bt_gap_dev_prop_t *property = &param->disc_res.prop[i];
         if (property->type == ESP_BT_GAP_DEV_PROP_COD && property->val != NULL &&
-            property->len >= sizeof(cod)) {
+            property->len >= (int)sizeof(cod)) {
             memcpy(&cod, property->val, sizeof(cod));
             has_cod = true;
         } else if (property->type == ESP_BT_GAP_DEV_PROP_RSSI &&
-                   property->val != NULL && property->len >= sizeof(rssi)) {
+                   property->val != NULL && property->len >= (int)sizeof(rssi)) {
             memcpy(&rssi, property->val, sizeof(rssi));
         }
         copy_remote_name(&candidate, property);

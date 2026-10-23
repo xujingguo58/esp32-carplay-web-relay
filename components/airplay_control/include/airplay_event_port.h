@@ -27,6 +27,10 @@ esp_err_t airplay_event_port_start(const airplay_event_port_config_t *config,
 
 uint16_t airplay_event_port_get_port(const airplay_event_port_t *port);
 
-/* Stops the listener/connection, detaches the ControlCipher session, and waits
- * for its task to finish. Do not call synchronously from on_state. */
+/* The RTSP server owns the worker loop. Poll this descriptor alongside the
+ * RTSP socket to keep event I/O from allocating a second task stack. */
+int airplay_event_port_get_poll_fd(const airplay_event_port_t *port);
+void airplay_event_port_poll(airplay_event_port_t *port);
+
+/* Stops the listener/connection and detaches the ControlCipher session. */
 void airplay_event_port_stop(airplay_event_port_t *port);
