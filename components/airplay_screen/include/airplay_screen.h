@@ -25,8 +25,9 @@ typedef enum {
 } airplay_screen_message_type_t;
 
 typedef esp_err_t (*airplay_screen_message_cb_t)(airplay_screen_message_type_t type,
-                                                 const uint8_t *annex_b,
+                                                 uint8_t *annex_b,
                                                  size_t annex_b_len,
+                                                 size_t prefix_capacity,
                                                  uint64_t sender_time_ns,
                                                  uint64_t arrival_time_us,
                                                  void *context);
@@ -42,12 +43,14 @@ esp_err_t airplay_screen_derive_output_key(const uint8_t *shared_secret,
                                            uint64_t stream_connection_id,
                                            uint8_t output_key[AIRPLAY_SCREEN_KEY_BYTES]);
 /* Video bodies are decrypted and converted to Annex-B in place. The caller
- * must provide a writable buffer; on authentication failure the ciphertext
- * region may be zeroized by Mbed TLS. */
+ * must provide a writable buffer and report its writable prefix capacity;
+ * the callback may borrow the frame buffer until it returns. On authentication
+ * failure the ciphertext region may be zeroized by Mbed TLS. */
 esp_err_t airplay_screen_stream_process(airplay_screen_stream_t *stream,
                                        const uint8_t header[AIRPLAY_SCREEN_HEADER_BYTES],
                                        uint8_t *body,
                                        size_t body_len,
+                                       size_t body_prefix_capacity,
                                        uint64_t arrival_time_us);
 uint64_t airplay_screen_stream_frame_counter(const airplay_screen_stream_t *stream);
 uint32_t airplay_screen_stream_auth_failures(const airplay_screen_stream_t *stream);

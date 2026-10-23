@@ -46,9 +46,11 @@ typedef struct {
 
 static airplay_screen_server_t *s_server;
 
-static bool reserve_rx_body(airplay_screen_server_t *server, size_t required)
+static bool reserve_rx_body(airplay_screen_server_t *server, size_t required,
+                            size_t preserve_bytes)
 {
     if (required <= server->rx_body_capacity) return true;
+    if (preserve_bytes > server->rx_body_capacity) return false;
 
     size_t allocation_size = server->rx_body_capacity;
     if (allocation_size == 0U) {
@@ -63,6 +65,8 @@ static bool reserve_rx_body(airplay_screen_server_t *server, size_t required)
             allocation_size *= 2U;
         }
     }
+    if (allocation_size > SIZE_MAX - AIRPLAY_SCREEN_CONFIG_BYTES) return false;
+    size_t allocation_bytes = allocation_size + AIRPLAY_SCREEN_CONFIG_BYTES;
 
     const uint32_t psram_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
@@ -70,26 +74,38 @@ static bool reserve_rx_body(airplay_screen_server_t *server, size_t required)
     uint32_t caps = server->rx_body_caps;
 
     if (server->rx_body != NULL && caps == psram_caps) {
-        buffer = heap_caps_realloc(server->rx_body, allocation_size, psram_caps);
+        buffer = heap_caps_realloc(server->rx_body, allocation_bytes, psram_caps);
         caps = psram_caps;
     }
     if (buffer == NULL && heap_caps_get_total_size(MALLOC_CAP_SPIRAM) != 0U) {
-        buffer = heap_caps_malloc(allocation_size, psram_caps);
+        buffer = heap_caps_malloc(allocation_bytes, psram_caps);
         if (buffer != NULL) {
             if (server->rx_body != NULL) {
-                memset(server->rx_body, 0, server->rx_body_capacity);
+                if (preserve_bytes != 0U) {
+                    memcpy((uint8_t *)buffer + AIRPLAY_SCREEN_CONFIG_BYTES,
+                           server->rx_body + AIRPLAY_SCREEN_CONFIG_BYTES,
+                           preserve_bytes);
+                }
+                memset(server->rx_body, 0,
+                       server->rx_body_capacity + AIRPLAY_SCREEN_CONFIG_BYTES);
                 heap_caps_free(server->rx_body);
             }
             caps = psram_caps;
         }
     }
-    if (buffer == NULL && allocation_size <= 64U * 1024U) {
+    if (buffer == NULL && allocation_bytes <= 64U * 1024U) {
         if (server->rx_body != NULL && server->rx_body_caps == internal_caps) {
-            buffer = heap_caps_realloc(server->rx_body, allocation_size, internal_caps);
+            buffer = heap_caps_realloc(server->rx_body, allocation_bytes, internal_caps);
         } else {
-            buffer = heap_caps_malloc(allocation_size, internal_caps);
+            buffer = heap_caps_malloc(allocation_bytes, internal_caps);
             if (buffer != NULL && server->rx_body != NULL) {
-                memset(server->rx_body, 0, server->rx_body_capacity);
+                if (preserve_bytes != 0U) {
+                    memcpy((uint8_t *)buffer + AIRPLAY_SCREEN_CONFIG_BYTES,
+                           server->rx_body + AIRPLAY_SCREEN_CONFIG_BYTES,
+                           preserve_bytes);
+                }
+                memset(server->rx_body, 0,
+                       server->rx_body_capacity + AIRPLAY_SCREEN_CONFIG_BYTES);
                 heap_caps_free(server->rx_body);
             }
         }
@@ -106,7 +122,8 @@ static bool reserve_rx_body(airplay_screen_server_t *server, size_t required)
 static void release_rx_body(airplay_screen_server_t *server)
 {
     if (server->rx_body != NULL) {
-        memset(server->rx_body, 0, server->rx_body_capacity);
+        memset(server->rx_body, 0,
+               server->rx_body_capacity + AIRPLAY_SCREEN_CONFIG_BYTES);
         heap_caps_free(server->rx_body);
         server->rx_body = NULL;
         server->rx_body_capacity = 0U;
@@ -147,7 +164,7 @@ static bool read_screen_body(airplay_screen_server_t *server, int fd, size_t siz
         if (request > AIRPLAY_SCREEN_RX_CHUNK_BYTES) {
             request = AIRPLAY_SCREEN_RX_CHUNK_BYTES;
         }
-        if (!reserve_rx_body(server, offset + request)) {
+        if (!reserve_rx_body(server, offset + request, offset)) {
             ESP_LOGW(TAG, "screen_buffer=unavailable kind=receive requested=%u"
                           " capacity=%u free_internal=%u largest_internal=%u"
                           " free_psram=%u stack_hwm=%u",
@@ -159,7 +176,8 @@ static bool read_screen_body(airplay_screen_server_t *server, int fd, size_t siz
                      (unsigned)uxTaskGetStackHighWaterMark(NULL));
             return false;
         }
-        ssize_t received = recv(fd, server->rx_body + offset, request, 0);
+        ssize_t received = recv(fd, server->rx_body + AIRPLAY_SCREEN_CONFIG_BYTES + offset,
+                                request, 0);
         if (received > 0) {
             offset += (size_t)received;
             continue;
@@ -188,8 +206,12 @@ static void handle_client(airplay_screen_server_t *server, int fd)
         if (body_len != 0U && !read_screen_body(server, fd, body_len)) break;
         uint64_t frame_counter_before =
             airplay_screen_stream_frame_counter(server->stream);
+        uint8_t *body = server->rx_body != NULL
+                            ? server->rx_body + AIRPLAY_SCREEN_CONFIG_BYTES
+                            : NULL;
         esp_err_t err = airplay_screen_stream_process(server->stream, header,
-                                                      server->rx_body, body_len,
+                                                      body,
+                                                      body_len, AIRPLAY_SCREEN_CONFIG_BYTES,
                                                       (uint64_t)time_port_monotonic_us());
         uint64_t frame_counter_after =
             airplay_screen_stream_frame_counter(server->stream);
@@ -201,11 +223,14 @@ static void handle_client(airplay_screen_server_t *server, int fd)
             const char *rx_memory =
                 server->rx_body_caps == (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
                     ? "psram" : "internal";
-            ESP_LOGI(TAG, "screen_buffers=high_water body=%u rx=%u rx_memory=%s"
+            ESP_LOGI(TAG, "screen_buffers=high_water body=%u rx=%u prefix=%u"
+                          " rx_allocation=%u rx_memory=%s"
                           " decrypt=in_place free_internal=%u largest_internal=%u"
                           " free_psram=%u stack_hwm=%u",
                      (unsigned)server->max_body_observed,
                      (unsigned)server->rx_body_capacity,
+                     (unsigned)AIRPLAY_SCREEN_CONFIG_BYTES,
+                     (unsigned)(server->rx_body_capacity + AIRPLAY_SCREEN_CONFIG_BYTES),
                      rx_memory,
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
@@ -372,8 +397,10 @@ esp_err_t airplay_screen_server_start(uint16_t requested_port,
     }
     *out_port = server->bound_port;
     ESP_LOGI(TAG, "screen_listener=ready port=%u max_body=%u allocation=on_demand"
+                  " prefix_headroom=%u"
                   " free_internal=%u free_psram=%u",
              server->bound_port, (unsigned)max_body_bytes,
+             (unsigned)AIRPLAY_SCREEN_CONFIG_BYTES,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     return ESP_OK;

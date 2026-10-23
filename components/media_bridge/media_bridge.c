@@ -5,6 +5,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_peer_default.h"
+#include "media_h264_frame.h"
 #include "media_frame_gate.h"
 #include "media_keyframe_gate.h"
 #include "media_timestamp.h"
@@ -46,10 +47,13 @@ static void release_answer_command(answer_command_t *answer)
 }
 
 typedef struct {
+    uint8_t *data;
     size_t size;
     uint32_t pts;
     uint32_t keyframe_generation;
     bool is_keyframe;
+    /* Keeps the Screen RX buffer leased until the peer task finishes sending. */
+    TaskHandle_t producer_task;
 } live_frame_command_t;
 
 static esp_peer_handle_t s_peer;
@@ -67,12 +71,8 @@ static volatile uint32_t s_frames_sent;
 static volatile uint32_t s_frames_dropped;
 static volatile esp_peer_state_t s_peer_state = ESP_PEER_STATE_CLOSED;
 static portMUX_TYPE s_live_mux = portMUX_INITIALIZER_UNLOCKED;
-static uint8_t *s_live_buffer;
-static size_t s_live_buffer_capacity;
-static uint32_t s_live_buffer_caps;
 static uint8_t s_live_config[MEDIA_BRIDGE_LIVE_CONFIG_BYTES];
 static size_t s_live_config_len;
-static bool s_live_buffer_busy;
 static media_frame_gate_t s_live_frame_gate;
 static volatile bool s_live_source;
 static media_timestamp_mapper_t s_live_timestamp_mapper;
@@ -170,52 +170,6 @@ static bool frame_has_idr(const uint8_t *data, size_t size)
     return false;
 }
 
-static bool grow_live_buffer(size_t required)
-{
-    if (required <= s_live_buffer_capacity) return true;
-    const uint32_t psram_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
-    const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
-    uint32_t caps = s_live_buffer_caps;
-    void *buffer = NULL;
-
-    if (s_live_buffer != NULL && caps == psram_caps) {
-        buffer = heap_caps_realloc(s_live_buffer, required, psram_caps);
-        caps = psram_caps;
-    } else if (s_live_buffer == NULL && heap_caps_get_total_size(MALLOC_CAP_SPIRAM) != 0) {
-        buffer = heap_caps_malloc(required, psram_caps);
-        caps = psram_caps;
-    }
-
-    /* A previous small frame may have fallen back to internal RAM. Move it to
-     * PSRAM before growing, so one allocation failure does not pin the stream
-     * to the smaller internal heap for the rest of the session. */
-    if (buffer == NULL && heap_caps_get_total_size(MALLOC_CAP_SPIRAM) != 0) {
-        void *psram_buffer = heap_caps_malloc(required, psram_caps);
-        if (psram_buffer != NULL) {
-            if (s_live_buffer != NULL) {
-                memcpy(psram_buffer, s_live_buffer, s_live_buffer_capacity);
-                heap_caps_free(s_live_buffer);
-            }
-            buffer = psram_buffer;
-            caps = psram_caps;
-        }
-    }
-    if (buffer == NULL && required <= 64U * 1024U) {
-        if (s_live_buffer != NULL && s_live_buffer_caps == internal_caps) {
-            buffer = heap_caps_realloc(s_live_buffer, required, internal_caps);
-        } else {
-            buffer = heap_caps_malloc(required, internal_caps);
-            if (buffer != NULL && s_live_buffer != NULL) heap_caps_free(s_live_buffer);
-        }
-        caps = internal_caps;
-    }
-    if (buffer == NULL) return false;
-    s_live_buffer = buffer;
-    s_live_buffer_capacity = required;
-    s_live_buffer_caps = caps;
-    return true;
-}
-
 static QueueHandle_t begin_live_frame_submission(void)
 {
     QueueHandle_t queue = NULL;
@@ -254,22 +208,34 @@ static void delete_media_queues(void)
     if (live_frame_queue != NULL) vQueueDelete(live_frame_queue);
 }
 
+static void complete_live_frame(const live_frame_command_t *command,
+                                esp_err_t result)
+{
+    if (command != NULL && command->producer_task != NULL) {
+        (void)xTaskNotify(command->producer_task, (uint32_t)result,
+                          eSetValueWithOverwrite);
+    }
+}
+
 static void send_queued_live_frame(const live_frame_command_t *command)
 {
     if (command == NULL) return;
-    if (!s_connected || s_peer == NULL || command->size == 0) {
+    if (!s_connected || s_stop_requested || s_peer == NULL ||
+        command->data == NULL || command->size == 0) {
         ++s_frames_dropped;
-        keyframe_gate_note_drop(false);
-        goto release_slot;
+        keyframe_gate_note_drop(command->is_keyframe);
+        complete_live_frame(command, ESP_ERR_INVALID_STATE);
+        return;
     }
     if (!keyframe_gate_accepts(command->is_keyframe)) {
         ++s_frames_dropped;
         keyframe_gate_note_drop(command->is_keyframe);
-        goto release_slot;
+        complete_live_frame(command, ESP_ERR_INVALID_STATE);
+        return;
     }
     esp_peer_video_frame_t frame = {
         .pts = command->pts,
-        .data = s_live_buffer,
+        .data = command->data,
         .size = (int)command->size,
     };
     int result = esp_peer_send_video(s_peer, &frame);
@@ -282,12 +248,12 @@ static void send_queued_live_frame(const live_frame_command_t *command)
         keyframe_gate_note_send(command->is_keyframe, false,
                                 command->keyframe_generation);
         ESP_LOGW(TAG, "live_video_send=failed result=%d bytes=%u", result, (unsigned)command->size);
+        complete_live_frame(command,
+                            result == ESP_PEER_ERR_WOULD_BLOCK
+                                ? ESP_ERR_TIMEOUT : ESP_ERR_INVALID_STATE);
+        return;
     }
-
-release_slot:
-    portENTER_CRITICAL(&s_live_mux);
-    s_live_buffer_busy = false;
-    portEXIT_CRITICAL(&s_live_mux);
+    complete_live_frame(command, ESP_OK);
 }
 
 static const char *peer_state_name(esp_peer_state_t state)
@@ -523,6 +489,12 @@ static void media_bridge_task(void *argument)
     s_connected = false;
     portEXIT_CRITICAL(&s_live_mux);
     for (;;) {
+        live_frame_command_t pending_frame;
+        /* Complete queued loans before waiting for active producers to leave. */
+        if (s_live_frame_queue != NULL &&
+            xQueueReceive(s_live_frame_queue, &pending_frame, 0) == pdTRUE) {
+            send_queued_live_frame(&pending_frame);
+        }
         portENTER_CRITICAL(&s_live_mux);
         bool producers_done = media_frame_gate_is_drained(&s_live_frame_gate);
         portEXIT_CRITICAL(&s_live_mux);
@@ -534,14 +506,7 @@ static void media_bridge_task(void *argument)
         esp_peer_close(s_peer);
         s_peer = NULL;
     }
-    portENTER_CRITICAL(&s_live_mux);
-    s_live_buffer_busy = false;
-    portEXIT_CRITICAL(&s_live_mux);
     delete_media_queues();
-    heap_caps_free(s_live_buffer);
-    s_live_buffer = NULL;
-    s_live_buffer_capacity = 0;
-    s_live_buffer_caps = 0;
     s_signal_cb = NULL;
     s_signal_context = NULL;
     s_started = false;
@@ -680,7 +645,13 @@ esp_err_t media_bridge_start(media_bridge_signal_cb_t signal_cb, void *context)
         media_bridge_stop();
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "peer_open=ready video=H264/320x240@10fps test_stream=%d", CONFIG_CARPLAY_WEBRTC_TEST_STREAM);
+    ESP_LOGI(TAG, "peer_open=ready video=H264/320x240@10fps"
+                  " frame_buffer=borrowed_rx queue_depth=1 test_stream=%d"
+                  " free_internal=%u largest_internal=%u free_psram=%u",
+             CONFIG_CARPLAY_WEBRTC_TEST_STREAM,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     return ESP_OK;
 }
 
@@ -732,10 +703,6 @@ esp_err_t media_bridge_set_h264_config(const uint8_t *annex_b_parameter_sets, si
         return ESP_ERR_INVALID_ARG;
     }
     portENTER_CRITICAL(&s_live_mux);
-    if (s_live_buffer_busy) {
-        portEXIT_CRITICAL(&s_live_mux);
-        return ESP_ERR_TIMEOUT;
-    }
     if (size != 0) memcpy(s_live_config, annex_b_parameter_sets, size);
     s_live_config_len = size;
     s_live_source = size != 0;
@@ -746,12 +713,14 @@ esp_err_t media_bridge_set_h264_config(const uint8_t *annex_b_parameter_sets, si
     return ESP_OK;
 }
 
-esp_err_t media_bridge_send_h264(const uint8_t *annex_b_access_unit,
-                                 size_t size,
-                                 uint64_t sender_time_ns,
-                                 uint64_t arrival_time_us)
+esp_err_t media_bridge_send_h264_borrowed(uint8_t *annex_b_access_unit,
+                                          size_t prefix_capacity,
+                                          size_t size,
+                                          uint64_t sender_time_ns,
+                                          uint64_t arrival_time_us)
 {
-    if (annex_b_access_unit == NULL || size == 0 ||
+    if (annex_b_access_unit == NULL || size == 0 || prefix_capacity >
+        MEDIA_BRIDGE_LIVE_CONFIG_BYTES ||
         size > MEDIA_BRIDGE_MAX_LIVE_FRAME_BYTES) {
         ++s_frames_dropped;
         keyframe_gate_note_drop(false);
@@ -778,40 +747,32 @@ esp_err_t media_bridge_send_h264(const uint8_t *annex_b_access_unit,
     }
 
     portENTER_CRITICAL(&s_live_mux);
-    if (s_live_buffer_busy) {
+    media_h264_prepared_frame_t prepared_frame = {0};
+    size_t config_len = is_keyframe ? s_live_config_len : 0U;
+    if (config_len > MEDIA_BRIDGE_MAX_LIVE_FRAME_BYTES - size ||
+        !media_h264_prepare_borrowed_frame(
+            annex_b_access_unit, prefix_capacity, size,
+            s_live_config, config_len, is_keyframe, &prepared_frame)) {
         portEXIT_CRITICAL(&s_live_mux);
         ++s_frames_dropped;
         keyframe_gate_note_drop(is_keyframe);
         end_live_frame_submission();
-        return ESP_ERR_TIMEOUT;
+        return ESP_ERR_INVALID_SIZE;
     }
-    s_live_buffer_busy = true;
-    size_t config_len = is_keyframe ? s_live_config_len : 0;
     s_live_source = true;
     portEXIT_CRITICAL(&s_live_mux);
 
-    size_t frame_size = config_len + size;
-    if (frame_size > MEDIA_BRIDGE_MAX_LIVE_FRAME_BYTES || !grow_live_buffer(frame_size)) {
-        portENTER_CRITICAL(&s_live_mux);
-        s_live_buffer_busy = false;
-        portEXIT_CRITICAL(&s_live_mux);
-        ++s_frames_dropped;
-        keyframe_gate_note_drop(is_keyframe);
-        ESP_LOGW(TAG, "live_video_buffer=unavailable bytes=%u", (unsigned)frame_size);
-        end_live_frame_submission();
-        return ESP_ERR_NO_MEM;
-    }
-    if (config_len != 0) memcpy(s_live_buffer, s_live_config, config_len);
-    memcpy(s_live_buffer + config_len, annex_b_access_unit, size);
     bool used_sender_clock = false;
     uint32_t pts_90khz = media_timestamp_mapper_map(
         &s_live_timestamp_mapper, sender_time_ns, arrival_time_us,
         &used_sender_clock);
     live_frame_command_t command = {
-        .size = frame_size,
+        .data = prepared_frame.data,
+        .size = prepared_frame.size,
         .pts = pts_90khz,
         .keyframe_generation = keyframe_gate_generation(),
         .is_keyframe = is_keyframe,
+        .producer_task = xTaskGetCurrentTaskHandle(),
     };
     if (!s_live_pts_source_known ||
         s_live_pts_source_is_sender != used_sender_clock) {
@@ -822,17 +783,19 @@ esp_err_t media_bridge_send_h264(const uint8_t *annex_b_access_unit,
     }
     if (is_keyframe) keyframe_gate_note_keyframe_queued(command.keyframe_generation);
     if (xQueueSend(queue, &command, 0) != pdPASS) {
-        portENTER_CRITICAL(&s_live_mux);
-        s_live_buffer_busy = false;
-        portEXIT_CRITICAL(&s_live_mux);
         ++s_frames_dropped;
         keyframe_gate_note_queue_failed(is_keyframe,
                                         command.keyframe_generation);
         end_live_frame_submission();
         return ESP_ERR_TIMEOUT;
     }
+    /* The RX task cannot reuse its buffer until esp_peer_send_video returns. */
+    uint32_t completion_value = (uint32_t)ESP_ERR_INVALID_STATE;
+    while (xTaskNotifyWait(0U, UINT32_MAX, &completion_value,
+                           portMAX_DELAY) != pdTRUE) {
+    }
     end_live_frame_submission();
-    return ESP_OK;
+    return (esp_err_t)completion_value;
 }
 
 void media_bridge_stop(void)

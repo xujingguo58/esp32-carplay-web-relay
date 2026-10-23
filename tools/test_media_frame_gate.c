@@ -2,8 +2,10 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <string.h>
 
 #include "media_frame_gate.h"
+#include "media_h264_frame.h"
 #include "media_keyframe_gate.h"
 
 typedef struct {
@@ -135,6 +137,39 @@ static void test_keyframe_recovery(void)
     assert(media_keyframe_gate_accepts(&gate, non_keyframe));
 }
 
+static void test_borrowed_h264_frame(void)
+{
+    static const uint8_t parameter_sets[] = {0x67U, 0x42U, 0x00U, 0x1eU};
+    static const uint8_t idr[] = {0x00U, 0x00U, 0x00U, 0x01U, 0x65U, 0xaaU};
+    uint8_t storage[16U + sizeof(idr)] = {0};
+    uint8_t *access_unit = storage + 16U;
+    memcpy(access_unit, idr, sizeof(idr));
+
+    media_h264_prepared_frame_t prepared = {0};
+    assert(media_h264_prepare_borrowed_frame(
+        access_unit, 16U, sizeof(idr), parameter_sets,
+        sizeof(parameter_sets), true, &prepared));
+    assert(prepared.data == access_unit - sizeof(parameter_sets));
+    assert(prepared.size == sizeof(parameter_sets) + sizeof(idr));
+    assert(memcmp(prepared.data, parameter_sets, sizeof(parameter_sets)) == 0);
+    assert(memcmp(access_unit, idr, sizeof(idr)) == 0);
+
+    uint8_t delta_storage[16U + sizeof(idr)] = {0};
+    uint8_t *delta = delta_storage + 16U;
+    memcpy(delta, idr, sizeof(idr));
+    assert(media_h264_prepare_borrowed_frame(
+        delta, 16U, sizeof(idr), parameter_sets,
+        sizeof(parameter_sets), false, &prepared));
+    assert(prepared.data == delta);
+    assert(prepared.size == sizeof(idr));
+    assert(memcmp(delta, idr, sizeof(idr)) == 0);
+
+    memset(storage, 0x5a, sizeof(storage));
+    assert(!media_h264_prepare_borrowed_frame(
+        access_unit, sizeof(parameter_sets) - 1U, sizeof(idr), parameter_sets,
+        sizeof(parameter_sets), true, &prepared));
+}
+
 int main(void)
 {
     media_frame_gate_t gate;
@@ -166,5 +201,6 @@ int main(void)
     assert(gate.active_submissions == 0U);
     test_concurrent_stop_drain();
     test_keyframe_recovery();
+    test_borrowed_h264_frame();
     return 0;
 }

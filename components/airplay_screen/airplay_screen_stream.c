@@ -115,6 +115,7 @@ esp_err_t airplay_screen_stream_process(airplay_screen_stream_t *stream,
                                        const uint8_t header[AIRPLAY_SCREEN_HEADER_BYTES],
                                        uint8_t *body,
                                        size_t body_len,
+                                       size_t body_prefix_capacity,
                                        uint64_t arrival_time_us)
 {
     if (stream == NULL || header == NULL || (body == NULL && body_len != 0)) {
@@ -134,7 +135,7 @@ esp_err_t airplay_screen_stream_process(airplay_screen_stream_t *stream,
         }
         stream->config_len = config_len;
         return stream->callback(AIRPLAY_SCREEN_MESSAGE_CONFIG_H264,
-                                stream->config, stream->config_len,
+                                stream->config, stream->config_len, 0U,
                                 info.sender_time_ns, arrival_time_us, stream->context);
     }
 
@@ -155,7 +156,7 @@ esp_err_t airplay_screen_stream_process(airplay_screen_stream_t *stream,
         return ESP_ERR_INVALID_RESPONSE;
     }
     return stream->callback(AIRPLAY_SCREEN_MESSAGE_FRAME_H264,
-                            body, ciphertext_len,
+                            body, ciphertext_len, body_prefix_capacity,
                             info.sender_time_ns, arrival_time_us, stream->context);
 }
 

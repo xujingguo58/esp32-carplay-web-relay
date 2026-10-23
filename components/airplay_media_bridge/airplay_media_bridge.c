@@ -6,8 +6,9 @@
 #include "mbedtls/platform_util.h"
 
 esp_err_t airplay_media_bridge_on_screen_message(airplay_screen_message_type_t type,
-                                                 const uint8_t *annex_b,
+                                                 uint8_t *annex_b,
                                                  size_t annex_b_len,
+                                                 size_t prefix_capacity,
                                                  uint64_t sender_time_ns,
                                                  uint64_t arrival_time_us,
                                                  void *context)
@@ -19,8 +20,9 @@ esp_err_t airplay_media_bridge_on_screen_message(airplay_screen_message_type_t t
     case AIRPLAY_SCREEN_MESSAGE_CONFIG_H264:
         return media_bridge_set_h264_config(annex_b, annex_b_len);
     case AIRPLAY_SCREEN_MESSAGE_FRAME_H264:
-        return media_bridge_send_h264(annex_b, annex_b_len, sender_time_ns,
-                                      arrival_time_us);
+        return media_bridge_send_h264_borrowed(annex_b, prefix_capacity,
+                                               annex_b_len, sender_time_ns,
+                                               arrival_time_us);
     default:
         return ESP_ERR_NOT_SUPPORTED;
     }

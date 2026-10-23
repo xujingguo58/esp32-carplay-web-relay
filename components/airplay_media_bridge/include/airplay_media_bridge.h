@@ -9,8 +9,9 @@
  * update the WebRTC sender's SPS/PPS; decrypted access units enter its bounded
  * send queue. The caller must stop the screen server before stopping media. */
 esp_err_t airplay_media_bridge_on_screen_message(airplay_screen_message_type_t type,
-                                                 const uint8_t *annex_b,
+                                                 uint8_t *annex_b,
                                                  size_t annex_b_len,
+                                                 size_t prefix_capacity,
                                                  uint64_t sender_time_ns,
                                                  uint64_t arrival_time_us,
                                                  void *context);
