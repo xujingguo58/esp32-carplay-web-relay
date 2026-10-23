@@ -25,6 +25,15 @@
 #include "time_port.h"
 
 #define WS_MAX_MESSAGE_BYTES 4096
+#define WS_IDLE_TIMEOUT_MS 20000U
+#define WEB_MAX_OPEN_SOCKETS 4U
+#define WS_MAX_PENDING_SESSIONS 2U
+
+typedef struct {
+    uint64_t last_rx_ms;
+    web_gateway_rate_limiter_t rate_limiter;
+    bool rate_limited;
+} websocket_session_t;
 
 static const char *TAG = "web_gateway";
 static httpd_handle_t s_server;
@@ -37,8 +46,6 @@ static input_bridge_t *s_input_bridge;
 static esp_timer_handle_t s_touch_watchdog_timer;
 static bool s_touch_watchdog_work_queued;
 static bool s_touch_release_pending;
-static web_gateway_rate_limiter_t s_websocket_rate_limiter;
-static bool s_websocket_rate_limited;
 static web_gateway_pairing_t s_pairing;
 static const char s_pairing_code[WEB_GATEWAY_PAIRING_CODE_LENGTH + 1] = "11111111";
 static uint16_t s_display_width_pixels = 320U;
@@ -46,9 +53,29 @@ static uint16_t s_display_height_pixels = 240U;
 static uint16_t s_display_rotation_degrees;
 static bool s_display_geometry_from_airplay;
 
+static void websocket_check_liveness(void)
+{
+    if (s_server == NULL) return;
+    int sockets[WEB_MAX_OPEN_SOCKETS];
+    size_t count = WEB_MAX_OPEN_SOCKETS;
+    if (httpd_get_client_list(s_server, &count, sockets) != ESP_OK) return;
+    uint64_t now_ms = (uint64_t)time_port_monotonic_ms();
+    for (size_t i = 0; i < count; ++i) {
+        int fd = sockets[i];
+        websocket_session_t *session = httpd_sess_get_ctx(s_server, fd);
+        if (session == NULL) continue;
+        if (now_ms - session->last_rx_ms >= WS_IDLE_TIMEOUT_MS) {
+            ESP_LOGW(TAG, "websocket_session=idle_timeout fd=%d idle_ms=%llu", fd,
+                     (unsigned long long)(now_ms - session->last_rx_ms));
+            (void)httpd_sess_trigger_close(s_server, fd);
+        }
+    }
+}
+
 static void touch_watchdog_work(void *context)
 {
     (void)context;
+    websocket_check_liveness();
     portENTER_CRITICAL(&s_touch_watchdog_mux);
     bool release_pending = s_touch_release_pending;
     s_touch_release_pending = false;
@@ -105,6 +132,7 @@ static bool input_report_callback(uint32_t hid_uid, const uint8_t *report,
 static const char INDEX_HTML[] =
     "<!doctype html><html lang=\"zh-CN\"><head>"
     "<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<link rel=\"icon\" href=\"data:,\">"
     "<title>ESP32 CarPlay Web Relay · M2</title><style>"
     "*{box-sizing:border-box}body{margin:0;background:#101820;color:#edf2f4;font:16px system-ui,sans-serif}"
     "header{padding:12px 18px;background:#1d2b34;display:flex;gap:16px;align-items:center;flex-wrap:wrap}"
@@ -126,7 +154,7 @@ static const char INDEX_HTML[] =
     "<section><b>设备指标</b><pre id=\"metrics\">读取中…</pre></section></main><script>"
     "const state=document.querySelector('#state'),video=document.querySelector('#video'),overlay=document.querySelector('#overlay');"
     "const pairing=document.querySelector('#pairing'),pairCode=document.querySelector('#pair-code'),pairHint=document.querySelector('#pair-hint');"
-    "const touchCount=document.querySelector('#touch-count'),touchLast=document.querySelector('#touch-last');let ws,pc,echoes=0,pendingCandidates=[];"
+    "const touchCount=document.querySelector('#touch-count'),touchLast=document.querySelector('#touch-last');let ws,pc,echoes=0,pendingCandidates=[],reconnectTimer,lastSignal=0;"
     "const activePointers=new Set(),lastMoves=new Map();"
     "function setState(s){state.textContent=s}function send(o){if(ws&&ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify(o))}"
     "function closePeer(){if(pc){pc.close();pc=null}pendingCandidates=[];video.srcObject=null;overlay.hidden=false}"
@@ -143,16 +171,20 @@ static const char INDEX_HTML[] =
     "if(outside&&phase==='down')return null;return{x:Math.max(0,Math.min(1,(clientX-left)/w)),y:Math.max(0,Math.min(1,(clientY-top)/h))}}"
     "async function offer(sdp){closePeer();pc=new RTCPeerConnection({iceServers:[]});const p=pc;"
     "p.ontrack=e=>{video.srcObject=e.streams[0]||new MediaStream([e.track]);video.play().catch(()=>{});overlay.hidden=true};"
-    "p.onconnectionstatechange=()=>setState('WebRTC '+p.connectionState);"
+    "p.onconnectionstatechange=()=>{if(pc===p)setState('WebRTC '+p.connectionState)};"
     "await p.setRemoteDescription({type:'offer',sdp});while(pendingCandidates.length)await p.addIceCandidate(pendingCandidates.shift());const a=await p.createAnswer();"
     "a.sdp=answerSetupForOffer(sdp,a.sdp);await p.setLocalDescription(a);await waitIce(p);"
-    "if(ws&&ws.readyState===WebSocket.OPEN)send({type:'rtc-answer',sdp:p.localDescription.sdp})}"
-    "function connect(){closePeer();if(ws)ws.close();const scheme=location.protocol==='https:'?'wss':'ws';"
-    "ws=new WebSocket(scheme+'://'+location.host+'/ws');ws.onopen=()=>setState('信令已连接，请输入串口配对码');"
-    "ws.onclose=()=>{closePeer();activePointers.clear();lastMoves.clear();pairing.hidden=false;pairHint.textContent='连接已关闭，请重新配对';setState('信令断开')};ws.onerror=()=>setState('信令错误');"
-    "ws.onmessage=async e=>{let m;try{m=JSON.parse(e.data)}catch(_){return}"
+    "if(pc===p&&ws&&ws.readyState===WebSocket.OPEN)send({type:'rtc-answer',sdp:p.localDescription.sdp})}"
+    "function connect(){clearTimeout(reconnectTimer);const previous=ws;ws=null;if(previous)previous.close();closePeer();const scheme=location.protocol==='https:'?'wss':'ws';"
+    "const w=new WebSocket(scheme+'://'+location.host+'/ws');ws=w;const opening=setTimeout(()=>{if(ws===w&&w.readyState===WebSocket.CONNECTING)w.close()},10000);"
+    "w.onopen=()=>{if(ws!==w)return;clearTimeout(opening);lastSignal=Date.now();pairing.hidden=false;pairHint.textContent='请输入配对码以启动媒体';setState('信令已连接，请输入串口配对码')};"
+    "w.onclose=e=>{clearTimeout(opening);if(ws!==w)return;ws=null;closePeer();activePointers.clear();lastMoves.clear();pairing.hidden=false;"
+    "if(e?.code===1008){pairHint.textContent='请关闭旧页面，再点击重新连接';setState('页面连接数量已达上限');return}"
+    "pairHint.textContent='连接已关闭，重连后请重新配对';setState('信令断开，正在重连…');reconnectTimer=setTimeout(connect,2000)};"
+    "w.onerror=()=>{if(ws===w)setState('信令错误，等待重连')};"
+    "w.onmessage=async e=>{if(ws!==w)return;lastSignal=Date.now();let m;try{m=JSON.parse(e.data)}catch(_){return}"
     "if(m.type==='paired'){pairing.hidden=true;pairCode.value='';setState('配对成功，等待 WebRTC');}"
-    "else if(m.type==='pair-error'){pairing.hidden=false;pairHint.textContent='配对失败：'+m.reason}"
+    "else if(m.type==='pair-error'){pairing.hidden=false;pairHint.textContent=m.reason==='media_session_in_use'?'另一个页面已配对，请先断开旧页面':'配对失败：'+m.reason}"
     "if(m.type==='rtc-offer'){try{await offer(m.sdp)}catch(err){setState('WebRTC 协商失败：'+err)}}"
     "else if(m.type==='rtc-candidate'&&typeof m.payload==='string'&&pc){const c={candidate:m.payload,sdpMLineIndex:0};"
     "if(pc.remoteDescription)pc.addIceCandidate(c).catch(err=>setState('ICE candidate 失败：'+err));else pendingCandidates.push(c)}"
@@ -163,6 +195,7 @@ static const char INDEX_HTML[] =
     "document.querySelector('#pair-submit').onclick=()=>send({type:'pair',code:pairCode.value.trim().toLowerCase()});"
     "pairCode.addEventListener('keydown',e=>{if(e.key==='Enter')document.querySelector('#pair-submit').click()});"
     "document.querySelector('#reconnect').onclick=connect;connect();"
+    "setInterval(()=>{if(ws&&ws.readyState===WebSocket.OPEN){if(Date.now()-lastSignal>20000)ws.close();else send({type:'ping'})}},5000);"
     "const stage=document.querySelector('#stage');"
     "function point(e,phase){const p=normalizedVideoPoint(e.clientX,e.clientY,video.getBoundingClientRect(),"
     "video.videoWidth,video.videoHeight,phase);if(!p)return false;send({type:'touch',phase,id:e.pointerId,x:p.x,y:p.y});return true}"
@@ -260,11 +293,29 @@ static esp_err_t media_signal_callback(const char *type, const char *payload, vo
     return err;
 }
 
+static esp_err_t finish_http_response(httpd_req_t *request, esp_err_t result)
+{
+    if (result != ESP_OK) return result;
+    /* Ordinary page/status requests must not retain the limited HTTP slots.
+     * The response has been sent synchronously; queue orderly socket cleanup. */
+    return httpd_sess_trigger_close(request->handle, httpd_req_to_sockfd(request));
+}
+
+static esp_err_t not_found_handler(httpd_req_t *request, httpd_err_code_t error)
+{
+    (void)error;
+    httpd_resp_set_hdr(request, "Connection", "close");
+    return finish_http_response(request, httpd_resp_send_err(
+        request, HTTPD_404_NOT_FOUND, "Not Found"));
+}
+
 static esp_err_t index_get_handler(httpd_req_t *request)
 {
     httpd_resp_set_type(request, "text/html; charset=utf-8");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-    return httpd_resp_send(request, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_set_hdr(request, "Connection", "close");
+    return finish_http_response(request,
+        httpd_resp_send(request, INDEX_HTML, HTTPD_RESP_USE_STRLEN));
 }
 
 static esp_err_t status_get_handler(httpd_req_t *request)
@@ -308,7 +359,8 @@ static esp_err_t status_get_handler(httpd_req_t *request)
 
     httpd_resp_set_type(request, "application/json; charset=utf-8");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-    return httpd_resp_send(request, body, body_len);
+    httpd_resp_set_hdr(request, "Connection", "close");
+    return finish_http_response(request, httpd_resp_send(request, body, body_len));
 }
 
 static bool valid_touch_message(const cJSON *message, const char **phase, int *pointer_id,
@@ -404,46 +456,76 @@ static esp_err_t websocket_handler(httpd_req_t *request)
 {
     int fd = httpd_req_to_sockfd(request);
     if (request->method == HTTP_GET) {
-        bool available;
-        portENTER_CRITICAL(&s_websocket_mux);
-        available = s_websocket_fd < 0;
-        if (available) {
-            s_websocket_fd = fd;
-            s_websocket_authenticated = false;
-            s_websocket_rate_limited = false;
-            web_gateway_rate_limiter_reset(&s_websocket_rate_limiter,
-                                           (uint64_t)time_port_monotonic_ms());
-        }
-        portEXIT_CRITICAL(&s_websocket_mux);
-        if (!available) {
-            httpd_resp_set_status(request, "409 Conflict");
-            httpd_resp_sendstr(request, "Only one browser media session is supported");
+        int sockets[WEB_MAX_OPEN_SOCKETS];
+        size_t count = WEB_MAX_OPEN_SOCKETS;
+        size_t pending = 0U;
+        if (httpd_get_client_list(request->handle, &count, sockets) != ESP_OK) {
             return ESP_FAIL;
         }
-        s_touch_echo_count = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (sockets[i] != fd && sockets[i] != s_websocket_fd &&
+                httpd_sess_get_ctx(request->handle, sockets[i]) != NULL) ++pending;
+        }
+        if (pending >= WS_MAX_PENDING_SESSIONS) {
+            ESP_LOGW(TAG, "websocket_session=rejected fd=%d reason=pending_limit count=%u",
+                     fd, (unsigned)pending);
+            uint8_t status[] = {0x03, 0xf0}; /* 1008: stop automatic retry. */
+            httpd_ws_frame_t frame = {
+                .type = HTTPD_WS_TYPE_CLOSE, .payload = status, .len = sizeof(status),
+            };
+            (void)httpd_ws_send_frame(request, &frame);
+            return httpd_sess_trigger_close(request->handle, fd);
+        }
+        websocket_session_t *session = calloc(1, sizeof(*session));
+        if (session == NULL) return ESP_ERR_NO_MEM;
+        session->last_rx_ms = (uint64_t)time_port_monotonic_ms();
+        web_gateway_rate_limiter_reset(&session->rate_limiter, session->last_rx_ms);
+        request->sess_ctx = session;
+        request->free_ctx = free;
+        /* Opening an unpaired page must not reserve the single media owner. */
         ESP_LOGI(TAG, "websocket_session=opened fd=%d awaiting_pairing=1", fd);
         return ESP_OK;
     }
 
+    websocket_session_t *session = request->sess_ctx;
+    if (session == NULL) return ESP_ERR_INVALID_STATE;
     httpd_ws_frame_t packet = {0};
     esp_err_t err = httpd_ws_recv_frame(request, &packet, 0);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "websocket_receive=length_failed error=%s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "websocket_receive=length_failed fd=%d type=%d error=%s", fd,
+                 packet.type, esp_err_to_name(err));
         return err;
     }
-    if (packet.type == HTTPD_WS_TYPE_CLOSE) {
-        s_websocket_authenticated = false;
-        input_bridge_release_all(s_input_bridge);
-        media_bridge_stop();
+    if (packet.type == HTTPD_WS_TYPE_CLOSE || packet.type == HTTPD_WS_TYPE_PING ||
+        packet.type == HTTPD_WS_TYPE_PONG) {
+        uint8_t control_payload[125];
+        if (packet.len > sizeof(control_payload)) return ESP_ERR_INVALID_SIZE;
+        if (packet.len != 0U) {
+            packet.payload = control_payload;
+            err = httpd_ws_recv_frame(request, &packet, sizeof(control_payload));
+            if (err != ESP_OK) return err;
+        }
+        session->last_rx_ms = (uint64_t)time_port_monotonic_ms();
+        if (packet.type == HTTPD_WS_TYPE_CLOSE) {
+            ESP_LOGI(TAG, "websocket_session=close_received fd=%d", fd);
+            if (websocket_is_active(fd)) s_websocket_authenticated = false;
+            (void)httpd_ws_send_frame(request, &packet);
+            /* ESP-IDF marks CLOSE and queues socket cleanup after this handler. */
+            return ESP_OK;
+        }
+        if (packet.type == HTTPD_WS_TYPE_PING) {
+            packet.type = HTTPD_WS_TYPE_PONG;
+            return httpd_ws_send_frame(request, &packet);
+        }
         return ESP_OK;
     }
-    if (s_websocket_rate_limited) return ESP_OK;
+    if (session->rate_limited) return ESP_OK;
     uint64_t now_ms = (uint64_t)time_port_monotonic_ms();
-    if (!web_gateway_rate_limiter_allow(&s_websocket_rate_limiter, now_ms)) {
-        s_websocket_rate_limited = true;
+    if (!web_gateway_rate_limiter_allow(&session->rate_limiter, now_ms)) {
+        session->rate_limited = true;
         ESP_LOGW(TAG, "websocket_rate_limit=exceeded fd=%d limit_per_second=%u burst=%u",
                  fd, WEB_GATEWAY_RATE_LIMIT_PER_SECOND, WEB_GATEWAY_RATE_LIMIT_BURST);
-        input_bridge_release_all(s_input_bridge);
+        if (websocket_is_active(fd)) input_bridge_release_all(s_input_bridge);
         if (s_server != NULL) {
             esp_err_t close_err = httpd_sess_trigger_close(s_server, fd);
             if (close_err != ESP_OK) {
@@ -468,6 +550,7 @@ static esp_err_t websocket_handler(httpd_req_t *request)
         free(payload);
         return err;
     }
+    session->last_rx_ms = (uint64_t)time_port_monotonic_ms();
     cJSON *message = cJSON_ParseWithLength(payload, packet.len);
     free(payload);
     if (message == NULL) {
@@ -475,10 +558,23 @@ static esp_err_t websocket_handler(httpd_req_t *request)
     }
 
     const cJSON *type_item = cJSON_GetObjectItemCaseSensitive(message, "type");
-    if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "pair") == 0) {
+    if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "ping") == 0) {
+        static uint8_t pong[] = "{\"type\":\"pong\"}";
+        httpd_ws_frame_t pong_frame = {
+            .type = HTTPD_WS_TYPE_TEXT, .payload = pong, .len = sizeof(pong) - 1U,
+        };
+        err = httpd_ws_send_frame(request, &pong_frame);
+    } else if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "pair") == 0) {
         const cJSON *code_item = cJSON_GetObjectItemCaseSensitive(message, "code");
         uint64_t now_ms = (uint64_t)time_port_monotonic_ms();
-        if (web_gateway_pairing_is_locked(&s_pairing, now_ms)) {
+        if (s_websocket_fd >= 0 && !websocket_is_active(fd)) {
+            ESP_LOGW(TAG, "websocket_pairing=rejected fd=%d owner_fd=%d reason=media_session_in_use",
+                     fd, s_websocket_fd);
+            err = send_pair_error(request, "media_session_in_use");
+        } else if (websocket_is_active(fd) && s_websocket_authenticated) {
+            /* Repeated clicks must not restart an already running peer. */
+            err = websocket_send_text_async(fd, "{\"type\":\"paired\"}");
+        } else if (web_gateway_pairing_is_locked(&s_pairing, now_ms)) {
             err = send_pair_error(request, "locked_try_later");
         } else if (!cJSON_IsString(code_item) || code_item->valuestring == NULL) {
             err = send_pair_error(request, "invalid_code");
@@ -489,20 +585,31 @@ static esp_err_t websocket_handler(httpd_req_t *request)
                                       ? "locked_try_later"
                                       : "invalid_code");
         } else {
+            portENTER_CRITICAL(&s_websocket_mux);
+            s_websocket_fd = fd;
             s_websocket_authenticated = true;
+            portEXIT_CRITICAL(&s_websocket_mux);
+            s_touch_echo_count = 0;
+            ESP_LOGI(TAG, "websocket_pairing=accepted fd=%d media_owner=claimed", fd);
             err = websocket_send_text_async(fd, "{\"type\":\"paired\"}");
             if (err == ESP_OK) {
                 err = media_bridge_start(media_signal_callback, (void *)(intptr_t)fd);
                 if (err != ESP_OK) {
+                    portENTER_CRITICAL(&s_websocket_mux);
+                    s_websocket_fd = -1;
                     s_websocket_authenticated = false;
+                    portEXIT_CRITICAL(&s_websocket_mux);
                     ESP_LOGE(TAG, "webrtc_session=start_failed error=%s", esp_err_to_name(err));
                     err = send_pair_error(request, "media_start_failed");
                 }
             } else {
+                portENTER_CRITICAL(&s_websocket_mux);
+                s_websocket_fd = -1;
                 s_websocket_authenticated = false;
+                portEXIT_CRITICAL(&s_websocket_mux);
             }
         }
-    } else if (!s_websocket_authenticated) {
+    } else if (!websocket_is_active(fd) || !s_websocket_authenticated) {
         err = send_pair_error(request, "pairing_required");
     } else if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "rtc-answer") == 0) {
         const cJSON *sdp_item = cJSON_GetObjectItemCaseSensitive(message, "sdp");
@@ -550,20 +657,19 @@ static esp_err_t websocket_handler(httpd_req_t *request)
 
 static void websocket_close_callback(httpd_handle_t server, int socket)
 {
-    (void)server;
+    bool was_websocket = httpd_sess_get_ctx(server, socket) != NULL;
     bool was_active = false;
     portENTER_CRITICAL(&s_websocket_mux);
     if (s_websocket_fd == socket) {
         s_websocket_fd = -1;
         s_websocket_authenticated = false;
-        s_websocket_rate_limited = false;
-        web_gateway_rate_limiter_reset(&s_websocket_rate_limiter,
-                                       (uint64_t)time_port_monotonic_ms());
         was_active = true;
     }
     portEXIT_CRITICAL(&s_websocket_mux);
+    if (was_websocket) {
+        ESP_LOGI(TAG, "websocket_session=closed fd=%d media_owner=%d", socket, was_active);
+    }
     if (was_active) {
-        ESP_LOGI(TAG, "websocket_session=closed fd=%d", socket);
         input_bridge_release_all(s_input_bridge);
         media_bridge_stop();
     }
@@ -627,9 +733,16 @@ esp_err_t web_gateway_start(void)
              s_display_geometry_from_airplay ? "airplay_info" : "m2_sample");
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 4;
-    config.max_open_sockets = 4;
+    config.max_open_sockets = WEB_MAX_OPEN_SOCKETS;
     config.stack_size = 8192;
     config.close_fn = websocket_close_callback;
+    /* LRU can evict a live WebSocket between watchdog updates. Never use it
+     * for signaling; bound pending sessions and close ordinary HTTP instead. */
+    config.lru_purge_enable = false;
+    config.keep_alive_enable = true;
+    config.keep_alive_idle = 5;
+    config.keep_alive_interval = 5;
+    config.keep_alive_count = 3;
 
     err = httpd_start(&s_server, &config);
     if (err != ESP_OK) {
@@ -659,6 +772,9 @@ esp_err_t web_gateway_start(void)
     };
 
     err = httpd_register_uri_handler(s_server, &index_uri);
+    if (err == ESP_OK) {
+        err = httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, not_found_handler);
+    }
     if (err == ESP_OK) {
         err = httpd_register_uri_handler(s_server, &status_uri);
     }

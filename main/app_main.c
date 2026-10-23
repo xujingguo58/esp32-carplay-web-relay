@@ -800,6 +800,10 @@ static void iap2_worker(void *argument)
 
 void app_main(void)
 {
+    /* esp_peer logs each RTP NACK sequence as INFO under this tag; keep the
+     * application-level peer_state logs while suppressing per-packet noise. */
+    esp_log_level_set("PEER_DEF", ESP_LOG_WARN);
+
     bool pairing_store_ready = false;
     if (!airplay_screen_crypto_self_test()) {
         ESP_LOGE(TAG, "airplay_crypto=self_test_failed chacha20_poly1305_unavailable");

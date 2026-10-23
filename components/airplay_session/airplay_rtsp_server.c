@@ -499,6 +499,28 @@ static void serve_client(airplay_rtsp_server_t *server, int client_fd)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     uint8_t rx[RTSP_SERVER_RX_CHUNK_BYTES];
     while (!server->stop_requested) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(client_fd, &read_fds);
+        int max_fd = client_fd;
+        int timing_fd = airplay_timing_port_get_socket_fd(server->timing_port);
+        if (timing_fd >= 0) {
+            FD_SET(timing_fd, &read_fds);
+            if (timing_fd > max_fd) max_fd = timing_fd;
+        }
+        struct timeval poll_timeout = {.tv_sec = 0, .tv_usec = 250000};
+        int selected = select(max_fd + 1, &read_fds, NULL, NULL, &poll_timeout);
+        if (selected < 0) {
+            if (errno == EINTR) continue;
+            ESP_LOGW(TAG, "rtsp_client=select_failed errno=%d", errno);
+            break;
+        }
+
+        bool client_readable = FD_ISSET(client_fd, &read_fds);
+        bool timing_readable = timing_fd >= 0 && FD_ISSET(timing_fd, &read_fds);
+        airplay_timing_port_poll(server->timing_port, timing_readable);
+        if (!client_readable) continue;
+
         int received = recv(client_fd, rx, sizeof(rx), 0);
         if (received < 0 && errno == EINTR) continue;
         if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;

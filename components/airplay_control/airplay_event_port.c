@@ -25,6 +25,16 @@
 
 static const char *TAG = "airplay_event";
 
+static void log_alloc_failure(const char *stage)
+{
+    ESP_LOGE(TAG,
+             "event_alloc=failed stage=%s free_internal=%u largest_internal=%u free_psram=%u",
+             stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+}
+
 struct airplay_event_port {
     int listener_fd;
     int client_fd;
@@ -170,10 +180,19 @@ esp_err_t airplay_event_port_start(const airplay_event_port_config_t *config,
     *out_port = NULL;
     if (config == NULL) return ESP_ERR_INVALID_ARG;
     esp_err_t control_result = airplay_control_port_init();
-    if (control_result != ESP_OK) return control_result;
+    if (control_result != ESP_OK) {
+        log_alloc_failure("control_mutex");
+        return control_result;
+    }
 
     int listener_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listener_fd < 0) return ESP_FAIL;
+    if (listener_fd < 0) {
+        ESP_LOGE(TAG, "event_listener=socket_failed errno=%d free_internal=%u largest_internal=%u",
+                 errno,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        return ESP_FAIL;
+    }
     int reuse = 1;
     (void)setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR,
                      &reuse, sizeof(reuse));
@@ -189,21 +208,33 @@ esp_err_t airplay_event_port_start(const airplay_event_port_config_t *config,
         return ESP_ERR_INVALID_STATE;
     }
     address.sin_addr.s_addr = ap_ip_info.ip.addr;
-    if (bind(listener_fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-        listen(listener_fd, 1) != 0) {
+    if (bind(listener_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        int socket_errno = errno;
         close(listener_fd);
+        ESP_LOGE(TAG, "event_listener=bind_failed errno=%d address=" IPSTR,
+                 socket_errno, IP2STR(&ap_ip_info.ip));
+        return ESP_FAIL;
+    }
+    if (listen(listener_fd, 1) != 0) {
+        int socket_errno = errno;
+        close(listener_fd);
+        ESP_LOGE(TAG, "event_listener=listen_failed errno=%d", socket_errno);
         return ESP_FAIL;
     }
     socklen_t address_len = sizeof(address);
     if (getsockname(listener_fd, (struct sockaddr *)&address,
                     &address_len) != 0 || address.sin_port == 0) {
+        int socket_errno = errno;
         close(listener_fd);
+        ESP_LOGE(TAG, "event_listener=getsockname_failed errno=%d port=%u",
+                 socket_errno, (unsigned)ntohs(address.sin_port));
         return ESP_FAIL;
     }
 
     airplay_event_port_t *port = calloc(1U, sizeof(*port));
     if (port == NULL) {
         close(listener_fd);
+        log_alloc_failure("listener_state");
         return ESP_ERR_NO_MEM;
     }
     port->listener_fd = listener_fd;
@@ -219,6 +250,7 @@ esp_err_t airplay_event_port_start(const airplay_event_port_config_t *config,
         close(listener_fd);
         mbedtls_platform_zeroize(port, sizeof(*port));
         free(port);
+        log_alloc_failure("stopped_semaphore");
         return ESP_ERR_NO_MEM;
     }
 
@@ -230,6 +262,7 @@ esp_err_t airplay_event_port_start(const airplay_event_port_config_t *config,
         vSemaphoreDelete(port->stopped);
         mbedtls_platform_zeroize(port, sizeof(*port));
         free(port);
+        log_alloc_failure("event_task_stack_or_tcb");
         return ESP_ERR_NO_MEM;
     }
     *out_port = port;

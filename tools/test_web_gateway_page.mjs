@@ -104,4 +104,82 @@ assert.equal(
   'a zero-sized video element has no touchable area',
 );
 
-process.stdout.write('embedded web JS syntax, DTLS role, and touch-rectangle tests passed\n');
+// Exercise the actual page script through refresh/close races and a dead link.
+const nodes = new Map();
+const sockets = [];
+const timeouts = new Map();
+const intervals = [];
+let nextTimer = 1;
+let now = 1000;
+class MockWebSocket {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  constructor() { this.readyState = 0; this.sent = []; this.closeCalls = 0; sockets.push(this); }
+  send(data) { this.sent.push(JSON.parse(data)); }
+  close() { this.closeCalls++; this.readyState = 3; }
+}
+class MockPeer {
+  async setRemoteDescription(description) { this.remoteDescription = description; }
+  async createAnswer() { return { type: 'answer', sdp: 'v=0\r\n' }; }
+  async setLocalDescription(description) { this.localDescription = description; }
+  async getStats() { return new Map(); }
+  close() { this.closed = true; }
+  iceGatheringState = 'complete';
+}
+const page = runInNewContext(`${scriptMatch[1]}; ({connect,offer,currentPeer:()=>pc,currentSocket:()=>ws})`, {
+  document: { querySelector(selector) {
+    if (!nodes.has(selector)) nodes.set(selector, { addEventListener() {}, value: '', hidden: false });
+    return nodes.get(selector);
+  } },
+  location: { protocol: 'http:', host: '192.168.4.1' },
+  WebSocket: MockWebSocket,
+  RTCPeerConnection: MockPeer,
+  Date: { now: () => now },
+  setTimeout(callback, delay) { const id = nextTimer++; timeouts.set(id, { callback, delay }); return id; },
+  clearTimeout(id) { timeouts.delete(id); },
+  setInterval(callback, delay) { intervals.push({ callback, delay }); },
+  addEventListener() {},
+  fetch: async () => ({ json: async () => ({}) }),
+});
+const first = sockets[0];
+first.readyState = MockWebSocket.OPEN;
+first.onopen();
+await page.offer('v=0\r\n');
+const oldPeer = page.currentPeer();
+nodes.get('#pairing').hidden = true;
+page.connect();
+const second = sockets[1];
+second.readyState = MockWebSocket.OPEN;
+second.onopen();
+assert.equal(nodes.get('#pairing').hidden, false, 'manual reconnect restores the pairing form');
+await page.offer('v=0\r\n');
+const newPeer = page.currentPeer();
+const newState = nodes.get('#state').textContent;
+first.onclose();
+first.onmessage({ data: JSON.stringify({ type: 'state', payload: 'stale' }) });
+oldPeer.onconnectionstatechange();
+assert.equal(page.currentPeer(), newPeer, 'late old-socket close preserves the new peer');
+assert.equal(nodes.get('#state').textContent, newState, 'old socket/peer events cannot overwrite current state');
+second.close();
+second.onclose();
+assert.equal(newPeer.closed, true, 'disconnect closes the matching media peer');
+const retries = [...timeouts.entries()].filter(([, timer]) => timer.delay === 2000);
+assert.equal(retries.length, 1, 'disconnect schedules one automatic reconnect');
+timeouts.delete(retries[0][0]);
+retries[0][1].callback();
+const third = sockets[2];
+third.readyState = MockWebSocket.OPEN;
+third.onopen();
+const heartbeat = intervals.find((timer) => timer.delay === 5000);
+heartbeat.callback();
+assert.equal(third.sent.at(-1).type, 'ping', 'heartbeat runs before pairing too');
+now += 21000;
+heartbeat.callback();
+assert.equal(third.closeCalls, 1, 'silent server closes the link so reconnect can run');
+const retryCount = () => [...timeouts.values()].filter((timer) => timer.delay === 2000).length;
+const retriesBeforePolicyClose = retryCount();
+third.onclose({ code: 1008 });
+assert.equal(retryCount(), retriesBeforePolicyClose, 'capacity rejection must not create a reconnect storm');
+assert.match(nodes.get('#state').textContent, /上限/, 'capacity rejection gives a visible reason');
+
+process.stdout.write('embedded web JS syntax, DTLS role, touch rectangle, reconnect races and heartbeat tests passed\n');
