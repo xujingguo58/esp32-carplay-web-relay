@@ -67,6 +67,7 @@ struct airplay_rtsp_server {
     SemaphoreHandle_t stopped;
     airplay_event_port_t *event_port;
     airplay_timing_port_t *timing_port;
+    bool state_in_psram;
 };
 
 static portMUX_TYPE s_server_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -86,6 +87,19 @@ static void *server_calloc_at(size_t count, size_t size, bool *allocated_in_psra
                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
+static airplay_rtsp_server_t *server_state_calloc(bool *allocated_in_psram)
+{
+    if (allocated_in_psram != NULL) *allocated_in_psram = false;
+    airplay_rtsp_server_t *server = heap_caps_calloc(
+        1U, sizeof(*server), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (server != NULL) {
+        if (allocated_in_psram != NULL) *allocated_in_psram = true;
+        return server;
+    }
+    return heap_caps_calloc(1U, sizeof(*server),
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
 static void event_state_changed(bool connected, void *context);
 static void screen_stream_exited(void *context);
 static void stop_event(void *context);
@@ -102,8 +116,7 @@ static void server_destroy(airplay_rtsp_server_t *server)
 {
     if (server == NULL) return;
     server_free(server->info_plist, AIRPLAY_RTSP_SESSION_INFO_MAX_BYTES);
-    mbedtls_platform_zeroize(server, sizeof(*server));
-    free(server);
+    server_free(server, sizeof(*server));
 }
 
 static bool socket_write_all(int fd, const uint8_t *bytes, size_t len)
@@ -506,14 +519,16 @@ static void serve_client(airplay_rtsp_server_t *server, int client_fd)
         return;
     }
 
-    ESP_LOGI(TAG, "rtsp_connection=allocated memory=%s bytes=%u free_internal=%u free_psram=%u",
+    ESP_LOGI(TAG, "rtsp_connection=allocated memory=%s bytes=%u free_internal=%u largest_internal=%u free_psram=%u",
              connection_in_psram ? "psram" : "internal",
              (unsigned)sizeof(*connection),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
-    ESP_LOGI(TAG, "rtsp_client=connected free_internal=%u free_psram=%u",
+    ESP_LOGI(TAG, "rtsp_client=connected free_internal=%u largest_internal=%u free_psram=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     while (!server->stop_requested) {
         fd_set read_fds;
@@ -685,11 +700,13 @@ esp_err_t airplay_rtsp_server_start(
         return ESP_FAIL;
     }
 
-    airplay_rtsp_server_t *server = calloc(1U, sizeof(*server));
+    bool state_in_psram = false;
+    airplay_rtsp_server_t *server = server_state_calloc(&state_in_psram);
     if (server == NULL) {
         close(listener_fd);
         return ESP_ERR_NO_MEM;
     }
+    server->state_in_psram = state_in_psram;
     server->info_plist = server_calloc_at(
         1U, AIRPLAY_RTSP_SESSION_INFO_MAX_BYTES,
         &server->info_plist_in_psram);
@@ -699,7 +716,7 @@ esp_err_t airplay_rtsp_server_start(
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         close(listener_fd);
-        free(server);
+        server_free(server, sizeof(*server));
         return ESP_ERR_NO_MEM;
     }
     server->config = *config;
@@ -737,11 +754,14 @@ esp_err_t airplay_rtsp_server_start(
         return ESP_ERR_NO_MEM;
     }
     *out_server = server;
-    ESP_LOGI(TAG, "rtsp_listener=ready ip=" IPSTR " port=%u plist_memory=%s plist_capacity=%u free_internal=%u free_psram=%u",
+    ESP_LOGI(TAG, "rtsp_listener=ready ip=" IPSTR " port=%u state_memory=%s state_bytes=%u plist_memory=%s plist_capacity=%u free_internal=%u largest_internal=%u free_psram=%u",
              IP2STR(&ap_ip.ip), (unsigned)server->port,
+             server->state_in_psram ? "psram" : "internal",
+             (unsigned)sizeof(*server),
              server->info_plist_in_psram ? "psram" : "internal",
              (unsigned)AIRPLAY_RTSP_SESSION_INFO_MAX_BYTES,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     return ESP_OK;
 }

@@ -9,6 +9,9 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#endif
 
 #define PAIRING_CONTENT_TYPE "application/pairing+tlv8"
 #define PAIRING_RESPONSE_MAX_BYTES 512U
@@ -17,6 +20,28 @@ struct airplay_rtsp_pairing {
     airplay_pair_setup_t *pair_setup;
     airplay_pair_verify_t *pair_verify;
 };
+
+static airplay_rtsp_pairing_t *rtsp_pairing_calloc(void)
+{
+#ifdef ESP_PLATFORM
+    airplay_rtsp_pairing_t *session = heap_caps_calloc(
+        1U, sizeof(*session), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (session != NULL) return session;
+    return heap_caps_calloc(1U, sizeof(*session),
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
+    return calloc(1U, sizeof(airplay_rtsp_pairing_t));
+#endif
+}
+
+static void rtsp_pairing_free(airplay_rtsp_pairing_t *session)
+{
+#ifdef ESP_PLATFORM
+    heap_caps_free(session);
+#else
+    free(session);
+#endif
+}
 
 static bool path_has_suffix(const char *path, const char *suffix)
 {
@@ -63,19 +88,19 @@ airplay_rtsp_pairing_result_t airplay_rtsp_pairing_create(
     if (out_session == NULL) return AIRPLAY_RTSP_PAIRING_INVALID_ARGUMENT;
     *out_session = NULL;
     if (config == NULL) return AIRPLAY_RTSP_PAIRING_INVALID_ARGUMENT;
-    airplay_rtsp_pairing_t *session = calloc(1U, sizeof(*session));
+    airplay_rtsp_pairing_t *session = rtsp_pairing_calloc();
     if (session == NULL) return AIRPLAY_RTSP_PAIRING_INTERNAL_ERROR;
     airplay_pair_setup_result_t setup_result = airplay_pair_setup_create(
         &config->pair_setup, &session->pair_setup);
     if (setup_result != AIRPLAY_PAIR_SETUP_OK) {
-        free(session);
+        rtsp_pairing_free(session);
         return AIRPLAY_RTSP_PAIRING_INVALID_ARGUMENT;
     }
     airplay_pair_verify_result_t verify_result = airplay_pair_verify_create(
         &config->pair_verify, &session->pair_verify);
     if (verify_result != AIRPLAY_PAIR_VERIFY_OK) {
         airplay_pair_setup_destroy(session->pair_setup);
-        free(session);
+        rtsp_pairing_free(session);
         return verify_result == AIRPLAY_PAIR_VERIFY_NO_MEMORY
                    ? AIRPLAY_RTSP_PAIRING_INTERNAL_ERROR
                    : AIRPLAY_RTSP_PAIRING_INVALID_ARGUMENT;
@@ -177,5 +202,5 @@ void airplay_rtsp_pairing_destroy(airplay_rtsp_pairing_t *session)
     airplay_pair_setup_destroy(session->pair_setup);
     airplay_pair_verify_destroy(session->pair_verify);
     memset(session, 0, sizeof(*session));
-    free(session);
+    rtsp_pairing_free(session);
 }

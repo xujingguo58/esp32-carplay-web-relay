@@ -16,6 +16,9 @@
 #include "mbedtls/hkdf.h"
 #include "mbedtls/md.h"
 #include "mbedtls/platform_util.h"
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#endif
 
 #define PS_METHOD 0x00U
 #define PS_IDENTIFIER 0x01U
@@ -56,6 +59,28 @@ struct airplay_pair_setup {
     ps_session_state_t state;
     bool random_failed;
 };
+
+static airplay_pair_setup_t *pair_setup_calloc(void)
+{
+#ifdef ESP_PLATFORM
+    airplay_pair_setup_t *session = heap_caps_calloc(
+        1U, sizeof(*session), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (session != NULL) return session;
+    return heap_caps_calloc(1U, sizeof(*session),
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
+    return calloc(1U, sizeof(airplay_pair_setup_t));
+#endif
+}
+
+static void pair_setup_free(airplay_pair_setup_t *session)
+{
+#ifdef ESP_PLATFORM
+    heap_caps_free(session);
+#else
+    free(session);
+#endif
+}
 
 static void scrub(void *buffer, size_t length)
 {
@@ -481,7 +506,7 @@ airplay_pair_setup_result_t airplay_pair_setup_create(
         pairing_code_len > AIRPLAY_PAIR_SETUP_MAX_PAIRING_CODE_BYTES) {
         return AIRPLAY_PAIR_SETUP_INVALID_ARGUMENT;
     }
-    airplay_pair_setup_t *session = calloc(1U, sizeof(*session));
+    airplay_pair_setup_t *session = pair_setup_calloc();
     if (session == NULL) return AIRPLAY_PAIR_SETUP_NO_MEMORY;
     session->provider = *config;
     memcpy(session->accessory_identifier, config->accessory_identifier,
@@ -563,5 +588,5 @@ void airplay_pair_setup_destroy(airplay_pair_setup_t *session)
     if (session == NULL) return;
     if (session->srp != NULL) airplay_srp6a_server_destroy(session->srp);
     scrub(session, sizeof(*session));
-    free(session);
+    pair_setup_free(session);
 }

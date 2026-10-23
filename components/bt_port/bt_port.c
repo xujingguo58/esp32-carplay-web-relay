@@ -608,11 +608,15 @@ esp_err_t bt_port_start(bt_port_rx_cb_t rx_cb, bt_port_state_cb_t state_cb, void
         return ESP_ERR_NO_MEM;
     }
 
+#if defined(CONFIG_BT_BLE_ENABLED) && CONFIG_BT_BLE_ENABLED
     esp_err_t err = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "bt_controller_ble_mem_release=failed error=%s", esp_err_to_name(err));
         return err;
     }
+#else
+    esp_err_t err;
+#endif
     esp_bt_controller_config_t controller_config = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     err = esp_bt_controller_init(&controller_config);
     if (err != ESP_OK) {

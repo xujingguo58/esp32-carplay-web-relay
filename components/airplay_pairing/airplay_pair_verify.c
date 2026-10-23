@@ -18,6 +18,9 @@
 #include "mbedtls/hkdf.h"
 #include "mbedtls/md.h"
 #include "mbedtls/platform_util.h"
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#endif
 
 #define PV_IDENTIFIER 0x01U
 #define PV_PUBLIC_KEY 0x03U
@@ -52,6 +55,28 @@ struct airplay_pair_verify {
     pv_session_state_t state;
     bool random_failed;
 };
+
+static airplay_pair_verify_t *pair_verify_calloc(void)
+{
+#ifdef ESP_PLATFORM
+    airplay_pair_verify_t *session = heap_caps_calloc(
+        1U, sizeof(*session), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (session != NULL) return session;
+    return heap_caps_calloc(1U, sizeof(*session),
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
+    return calloc(1U, sizeof(airplay_pair_verify_t));
+#endif
+}
+
+static void pair_verify_free(airplay_pair_verify_t *session)
+{
+#ifdef ESP_PLATFORM
+    heap_caps_free(session);
+#else
+    free(session);
+#endif
+}
 
 static int pv_rng(void *context, unsigned char *output, size_t output_len)
 {
@@ -458,7 +483,7 @@ airplay_pair_verify_result_t airplay_pair_verify_create(
         config->lookup_controller == NULL) {
         return AIRPLAY_PAIR_VERIFY_INVALID_ARGUMENT;
     }
-    airplay_pair_verify_t *session = calloc(1U, sizeof(*session));
+    airplay_pair_verify_t *session = pair_verify_calloc();
     if (session == NULL) return AIRPLAY_PAIR_VERIFY_NO_MEMORY;
     session->provider = *config;
     memcpy(session->accessory_identifier, config->accessory_identifier,
@@ -471,7 +496,7 @@ airplay_pair_verify_result_t airplay_pair_verify_create(
         mbedtls_ecp_group_free(&session->group);
         mbedtls_mpi_free(&session->private_key);
         scrub(session, sizeof(*session));
-        free(session);
+        pair_verify_free(session);
         return AIRPLAY_PAIR_VERIFY_CRYPTO_FAILED;
     }
     session->state = PV_SESSION_WAIT_M1;
@@ -601,5 +626,5 @@ void airplay_pair_verify_destroy(airplay_pair_verify_t *session)
     mbedtls_ecp_group_free(&session->group);
     mbedtls_mpi_free(&session->private_key);
     scrub(session, sizeof(*session));
-    free(session);
+    pair_verify_free(session);
 }

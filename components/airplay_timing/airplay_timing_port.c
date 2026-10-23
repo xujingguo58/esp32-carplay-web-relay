@@ -162,10 +162,11 @@ esp_err_t airplay_timing_port_start(const airplay_timing_port_config_t *config,
     port->peer_ipv4 = config->peer_ipv4;
     port->next_request_us = time_port_monotonic_us();
     *out_port = port;
-    ESP_LOGI(TAG, "timing_listener=ready ip=" IPSTR " port=%u peer_port=%u mode=rtsp_poll free_internal=%u free_psram=%u",
+    ESP_LOGI(TAG, "timing_listener=ready ip=" IPSTR " port=%u peer_port=%u mode=rtsp_poll free_internal=%u largest_internal=%u free_psram=%u",
              IP2STR(&ap_ip.ip), (unsigned)port->port,
              (unsigned)port->peer_port,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     return ESP_OK;
 }

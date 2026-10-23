@@ -12,6 +12,9 @@
 
 #include "mbedtls/bignum.h"
 #include "mbedtls/md.h"
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#endif
 
 #define SRP_USERNAME_MAX_BYTES 64U
 #define SRP_PAIRING_CODE_MAX_BYTES 64U
@@ -42,6 +45,28 @@ struct airplay_srp6a_server {
     char username[SRP_USERNAME_MAX_BYTES + 1U];
     bool spent;
 };
+
+static airplay_srp6a_server_t *srp_server_calloc(void)
+{
+#ifdef ESP_PLATFORM
+    airplay_srp6a_server_t *server = heap_caps_calloc(
+        1U, sizeof(*server), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (server != NULL) return server;
+    return heap_caps_calloc(1U, sizeof(*server),
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
+    return calloc(1U, sizeof(airplay_srp6a_server_t));
+#endif
+}
+
+static void srp_server_free(airplay_srp6a_server_t *server)
+{
+#ifdef ESP_PLATFORM
+    heap_caps_free(server);
+#else
+    free(server);
+#endif
+}
 
 typedef struct {
     const uint8_t *data;
@@ -107,7 +132,7 @@ void airplay_srp6a_server_destroy(airplay_srp6a_server_t *server)
     mbedtls_mpi_free(&server->private_b);
     mbedtls_mpi_free(&server->public_b);
     secure_zero(server, sizeof(*server));
-    free(server);
+    srp_server_free(server);
 }
 
 airplay_srp6a_result_t airplay_srp6a_server_start(const char *username,
@@ -130,7 +155,7 @@ airplay_srp6a_result_t airplay_srp6a_server_start(const char *username,
         return AIRPLAY_SRP6A_INVALID_ARGUMENT;
     }
 
-    airplay_srp6a_server_t *server = calloc(1, sizeof(*server));
+    airplay_srp6a_server_t *server = srp_server_calloc();
     if (server == NULL) return AIRPLAY_SRP6A_NO_MEMORY;
     mbedtls_mpi_init(&server->n);
     mbedtls_mpi_init(&server->g);

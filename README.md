@@ -22,7 +22,7 @@
 | M1：平台骨架 | SoftAP、HTTP 状态页、BR/EDR/RFCOMM 适配 | 开发板热点、蓝牙及共存行为 |
 | M2：浏览器样机 | 合成 H.264、WebRTC、WebSocket 信令、触控回显；用户确认实机视频播放正常 | 量化资源峰值和延迟数据尚未单独记录 |
 | M3：协议核心 | iAP2 状态机、MFi signer 接口、无线启动消息 | iPhone 蓝牙发现、认证和会话启动 |
-| M4：视频接收 | RTSP 配对、Screen DataStream 解密/组帧、WebRTC 媒体桥；`/info` plist 与 Event 缓冲使用 PSRAM 优先存储，Event I/O 复用 RTSP 任务 | 真实 CarPlay 视频、持续播放和重连；堆余量与任务栈需新固件实测 |
+| M4：视频接收 | RTSP 配对、Screen DataStream 解密/组帧、WebRTC 媒体桥；AirPlay 会话状态优先分配到 PSRAM，Event/Timing I/O 复用 RTSP 任务 | 真实 CarPlay 视频、持续播放和重连；堆余量与任务栈需新固件实测 |
 | M5：触控回传 | 触点映射、HID/Event Control 软件路径、断连清理 | iPhone 端 down/move/up 及释放行为 |
 
 运行中的 M2 固件发送的是**合成测试图像**，并会在网页标明它不是 CarPlay 画面。当前调试构建将网页配对码固定为 `11111111`，仅经 UART 输出；未完成配对时不会启动 WebRTC。各阶段实现和验收记录见 [开发路线图](docs/ROADMAP.md)。
@@ -32,6 +32,7 @@
 ### 硬件与软件
 
 - 目标芯片为支持 Bluetooth BR/EDR 的经典 ESP32；ESP32-S3、ESP32-C5 等仅支持 BLE 的芯片不能替代该蓝牙链路。
+- 项目使用 Classic BR/EDR 的 iAP2/SPP，不使用 BLE/GATT；默认、4 MB 和 8 MB 构建配置都关闭未用 BLE host，保留 Classic SMP 配对。
 - 推荐使用带 PSRAM 的模组（例如 ESP32-WROVER）。8 MB Flash profile 会以 40 MHz 自动检测并启用 PSRAM，并将 mbedTLS/DTLS 工作分配放入 PSRAM；没有检测到 PSRAM 时仍会启动，但 WebRTC 可能无法建立。当前 8 MB 调试 profile 要求经典 ESP32 Rev 3.0 或更新版本。4 MB profile 也可构建，2 MB 分区不足以容纳当前固件。Flash 容量不等于 PSRAM 容量。
 - 需要 ESP-IDF 5.5.3，并在已加载 ESP-IDF 环境的终端中运行命令。
 

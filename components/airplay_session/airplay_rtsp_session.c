@@ -45,7 +45,36 @@ struct airplay_rtsp_session {
     bool screen_started;
     bool record_active;
     bool control_cipher_active;
+    bool state_in_psram;
 };
+
+static airplay_rtsp_session_t *session_calloc(bool *allocated_in_psram)
+{
+    if (allocated_in_psram != NULL) *allocated_in_psram = false;
+#ifdef ESP_PLATFORM
+    airplay_rtsp_session_t *session = heap_caps_calloc(
+        1U, sizeof(*session), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (session != NULL) {
+        if (allocated_in_psram != NULL) *allocated_in_psram = true;
+        return session;
+    }
+    return heap_caps_calloc(1U, sizeof(*session),
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
+    return calloc(1U, sizeof(airplay_rtsp_session_t));
+#endif
+}
+
+static void session_free(airplay_rtsp_session_t *session)
+{
+    if (session == NULL) return;
+    mbedtls_platform_zeroize(session, sizeof(*session));
+#ifdef ESP_PLATFORM
+    heap_caps_free(session);
+#else
+    free(session);
+#endif
+}
 
 static bool path_has_suffix(const char *path, const char *suffix)
 {
@@ -581,12 +610,14 @@ static airplay_rtsp_session_result_t session_create(
         return AIRPLAY_RTSP_SESSION_INVALID_ARGUMENT;
     }
 
-    airplay_rtsp_session_t *session = calloc(1U, sizeof(*session));
+    bool state_in_psram = false;
+    airplay_rtsp_session_t *session = session_calloc(&state_in_psram);
     if (session == NULL) return AIRPLAY_RTSP_SESSION_NO_MEMORY;
+    session->state_in_psram = state_in_psram;
     airplay_rtsp_pairing_result_t pairing_result =
         airplay_rtsp_pairing_create(&config->pairing, &session->pairing);
     if (pairing_result != AIRPLAY_RTSP_PAIRING_HANDLED) {
-        free(session);
+        session_free(session);
         return pairing_result == AIRPLAY_RTSP_PAIRING_INTERNAL_ERROR
                    ? AIRPLAY_RTSP_SESSION_NO_MEMORY
                    : AIRPLAY_RTSP_SESSION_INVALID_ARGUMENT;
@@ -599,7 +630,7 @@ static airplay_rtsp_session_result_t session_create(
         if (session->owned_info_plist == NULL) {
             airplay_rtsp_pairing_destroy(session->pairing);
             memset(session, 0, sizeof(*session));
-            free(session);
+            session_free(session);
             return AIRPLAY_RTSP_SESSION_NO_MEMORY;
         }
         session->config.info_plist = session->owned_info_plist;
@@ -612,6 +643,18 @@ static airplay_rtsp_session_result_t session_create(
     }
     session->has_info = true;
     *out_session = session;
+#ifdef ESP_PLATFORM
+    ESP_LOGI(TAG, "session_state=allocated memory=%s bytes=%u free_internal=%u largest_internal=%u free_psram=%u",
+             session->state_in_psram ? "psram" : "internal",
+             (unsigned)sizeof(*session),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+#else
+    ESP_LOGI(TAG, "session_state=allocated memory=%s bytes=%u",
+             session->state_in_psram ? "psram" : "internal",
+             (unsigned)sizeof(*session));
+#endif
     return AIRPLAY_RTSP_SESSION_OK;
 }
 
@@ -746,5 +789,5 @@ void airplay_rtsp_session_destroy(airplay_rtsp_session_t *session)
     free_info_plist(session->owned_info_plist,
                     session->config.info_plist_len);
     memset(session, 0, sizeof(*session));
-    free(session);
+    session_free(session);
 }

@@ -192,11 +192,12 @@ esp_err_t airplay_event_port_start(const airplay_event_port_config_t *config,
     port->on_state = config->on_state;
     port->context = config->context;
     *out_port = port;
-    ESP_LOGI(TAG, "event_listener=ready ip=" IPSTR " port=%u state_memory=%s state_bytes=%u mode=rtsp_poll free_internal=%u free_psram=%u",
+    ESP_LOGI(TAG, "event_listener=ready ip=" IPSTR " port=%u state_memory=%s state_bytes=%u mode=rtsp_poll free_internal=%u largest_internal=%u free_psram=%u",
              IP2STR(&ap_ip_info.ip), (unsigned)port->port,
              port->state_in_psram ? "psram" : "internal",
              (unsigned)sizeof(*port),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     return ESP_OK;
 }
