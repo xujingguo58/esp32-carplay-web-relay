@@ -17,6 +17,7 @@
 #include "freertos/task.h"
 
 #define BT_PORT_DEVICE_NAME "ESP32-CarPlay"
+#define BT_PORT_COD_MINOR_CAR_AUDIO 0x20U
 #define BT_PORT_IAP2_UUID_BYTES { \
     0x00, 0x00, 0x00, 0x00, 0xde, 0xca, 0xfa, 0xde, \
     0xde, 0xca, 0xde, 0xaf, 0xde, 0xca, 0xca, 0xfe \
@@ -74,6 +75,58 @@ static esp_timer_handle_t s_discovery_retry_timer;
 
 static void begin_peer_discovery(void);
 static void begin_iap2_service_search(const esp_bd_addr_t address);
+
+static void apply_local_discovery_mode(bool enabled)
+{
+    if (!s_spp_ready) return;
+
+    const esp_bt_connection_mode_t connection_mode =
+        enabled ? ESP_BT_CONNECTABLE : ESP_BT_NON_CONNECTABLE;
+    const esp_bt_discovery_mode_t discovery_mode =
+        enabled ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE;
+    esp_err_t err = esp_bt_gap_set_scan_mode(connection_mode, discovery_mode);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "local_discoverability=set_failed enabled=%d error=%s",
+                 enabled, esp_err_to_name(err));
+        return;
+    }
+
+    ESP_LOGI(TAG, "local_discoverability=%s connectable=%d discoverable=%d reason=%s",
+             enabled ? "enabled" : "disabled", connection_mode, discovery_mode,
+             enabled ? "browser_media_ready" : "browser_not_ready");
+}
+
+static void configure_local_bt_identity(void)
+{
+    esp_bt_cod_t cod = {0};
+    cod.major = ESP_BT_COD_MAJOR_DEV_AV;
+    /* Bluetooth Assigned Numbers: Audio/Video, Car Audio minor device class. */
+    cod.minor = BT_PORT_COD_MINOR_CAR_AUDIO;
+    cod.service = ESP_BT_COD_SRVC_RENDERING | ESP_BT_COD_SRVC_AUDIO |
+                  ESP_BT_COD_SRVC_TELEPHONY;
+    esp_err_t err = esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "class_of_device=set_failed error=%s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "class_of_device=set_requested major=audio_video minor=car_audio"
+                      " services=rendering,audio,telephony");
+    }
+
+    esp_bt_eir_data_t eir = {
+        .fec_required = true,
+        .include_uuid = false,
+        .include_name = true,
+        .flag = ESP_BT_EIR_FLAG_GEN_DISC,
+    };
+    err = esp_bt_gap_config_eir_data(&eir);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "eir_data=config_failed error=%s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "eir_data=config_requested name=1 flags=general_discoverable");
+    }
+
+    apply_local_discovery_mode(s_discovery_enabled);
+}
 
 static void cancel_discovery_retry(void)
 {
@@ -405,6 +458,11 @@ static void gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *par
     case ESP_BT_GAP_MODE_CHG_EVT:
         ESP_LOGI(TAG, "radio_mode=changed mode=0x%02x", param->mode_chg.mode);
         break;
+    case ESP_BT_GAP_CONFIG_EIR_DATA_EVT:
+        ESP_LOGI(TAG, "eir_data=configured status=%d fields=%u",
+                 param->config_eir_data.stat,
+                 (unsigned)param->config_eir_data.eir_type_num);
+        break;
     default:
         ESP_LOGD(TAG, "gap_event=%d", event);
         break;
@@ -485,6 +543,7 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
         }
         s_spp_ready = true;
         ESP_LOGI(TAG, "spp_init=ready mode=callback role=client");
+        configure_local_bt_identity();
         begin_peer_discovery();
         break;
     case ESP_SPP_CL_INIT_EVT:
@@ -705,6 +764,7 @@ void bt_port_set_discovery_enabled(bool enabled)
     ESP_LOGI(TAG, "discovery_gate=%s reason=%s", enabled ? "open" : "closed",
              enabled ? "browser_media_ready" : "browser_not_ready");
     if (enabled) {
+        apply_local_discovery_mode(true);
         begin_peer_discovery();
     } else {
         cancel_discovery_retry();
@@ -714,6 +774,7 @@ void bt_port_set_discovery_enabled(bool enabled)
                 ESP_LOGW(TAG, "discovery=cancel_failed error=%s", esp_err_to_name(err));
             }
         }
+        apply_local_discovery_mode(false);
     }
 }
 

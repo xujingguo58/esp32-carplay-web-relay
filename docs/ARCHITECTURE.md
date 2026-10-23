@@ -62,7 +62,7 @@ flowchart LR
 - 使用经典 ESP32 的 Bluetooth BR/EDR 能力承接 iPhone 蓝牙启动流程。
 - 将 DiPlay 中 Android 蓝牙 socket、配对和服务发现调用替换为 ESP-IDF Bluetooth 接口。
 - 为 iAP2 传输提供 RFCOMM 通道及可靠的连接、超时、重连和断开事件。
-- 当前已有 RFCOMM SCN 3、iAP2 UUID 的 SDP RAW 记录和 ESP-IDF SPP 数据适配；BR/EDR 发现、配对、RFCOMM 行为及与 SoftAP 并发仍待板上验证。
+- `bt_port` 作为 BR/EDR 客户端发现 iPhone、查询对端 iAP2 SDP UUID 并连接其 RFCOMM 服务；本机名称、Audio/Video Car Audio Class of Device 和 EIR 名称均已配置。只有浏览器媒体就绪时，本机才进入 connectable/general-discoverable 并启动 iPhone inquiry；断开网页后停止发现并隐藏本机。主机测试验证了门控调用、CoD 和 EIR 参数，iPhone 实机可见性、配对、RFCOMM 行为及与 SoftAP 并发仍待板上验证。
 - RFCOMM 接收回调和 iAP2 worker 之间使用有界队列；任一级队列发生 RX 数据溢出时立即断开该 RFCOMM 会话，避免在已丢字节的 iAP2 流上继续解析。状态事件会优先于旧 RX 队列内容送达，以便 worker 清理并重置认证状态。
 
 ### 3.3 CarPlay 协议层 `cp_core`
@@ -81,7 +81,7 @@ Android `Activity`、`BluetoothSocket`、`WifiP2pManager`、`MediaCodec`、`Audi
 
 `iap2_core` 把本端最大未确认发送窗口限制为 1；接收端依据对端 SYNC 通告的 `maxOutgoing` 识别有序包和序号缺口。缺口时发送 iAP2 扩展 ACK，列出未缓存的缺失范围（包括当前乱序包），并在收到对端扩展 ACK 时立即重传匹配的未确认包；常规累计 ACK 与原有重传超时仍有效。只有纯 `0x40` ACK 帧的 payload 才送入 CSM 解析，组合 ACK/扩展 ACK 保持为链路控制。8 位序号按模 256 回绕；链路进入 READY 后重复 SYNC 只记为坏帧，不改写当前接收序号。`tools/test_iap2_core_host.sh` 使用 ASan/UBSan 覆盖缺口恢复、序号回绕、控制位组合隔离和重复 SYNC；由于 RFCOMM 自身为可靠有序传输，真实 iPhone 链路 trace 与蓝牙共存行为仍需硬件验证。
 
-`bt_port` 在自身 RX 队列或上层 iAP2 事件队列满时会关闭当前 RFCOMM 连接并清空待处理 RX，避免丢块后继续处理不完整的协议字节流；断连状态事件会清理 iAP2、MFi 与无线会话状态。`tools/test_bt_port_host.sh` 直接编译适配器并模拟同步 SPP 回调，覆盖本地 RX 队列溢出后的 disconnect、清队列和断连事件优先级；它不模拟 ESP-IDF SPP 并发回调或 FreeRTOS 队列调度，相关压力仍需硬件验证。
+`bt_port` 在自身 RX 队列或上层 iAP2 事件队列满时会关闭当前 RFCOMM 连接并清空待处理 RX，避免丢块后继续处理不完整的协议字节流；断连状态事件会清理 iAP2、MFi 与无线会话状态。`tools/test_bt_port_host.sh` 直接编译适配器并模拟同步 SPP 回调，覆盖 Car Audio CoD/EIR 设置、浏览器就绪时的可发现性门控，以及本地 RX 队列溢出后的 disconnect、清队列和断连事件优先级；它不模拟 ESP-IDF GAP/SPP 无线行为或 FreeRTOS 队列调度，相关压力仍需硬件验证。
 
 `iap2_mfi_auth` 将 `0xaa05` 成功通知限制在本 RFCOMM 会话中的 provider 签名 `0xaa02` challenge 响应 `0xaa03` 被 iAP2 对端在 link 层确认之后。仅被 RFCOMM 接口接受、进入 iAP2 发送队列或尚未收到 ACK 的帧不推进状态。即使 ACK 和 `0xaa05` 位于同一个对端 link frame，核心也先处理 ACK callback，再分发 CSM payload。`0xaa04`、iAP2 link 进入 DEAD、RFCOMM 断开或重连会重置认证阶段；主机测试覆盖越级成功拒绝、等待 ACK、piggyback 顺序、失败与重置。`iap2_identity` 也解析受限的 `0x1d03` 消息列表拒绝；不支持的认证消息或其他身份参数不会触发兼容重试。
 
@@ -158,7 +158,7 @@ Event Control 传输断开时，`airplay_rtsp_server` 调用 `web_gateway_releas
 - Bluetooth BR/EDR + 2.4 GHz SoftAP。
 - 外部车机屏幕通过浏览器解码 H.264；ESP32 仅处理接收、解密、打包和传输。
 
-Flash profile：当前固件镜像 `0x185040` 字节。2 MB 默认 app 分区约 1500 KiB，已无法容纳当前镜像；本项目的 `sdkconfig.defaults.4mb`/`partitions_4mb.csv` 与 `sdkconfig.defaults.8mb`/`partitions_8mb.csv` 分别配置 4 MB、8 MB 单应用分区。ESP-IDF 5.5.3 构建结果：4 MB 的 `0x3f0000` 分区余 `0x26afc0` 字节，8 MB 的 `0x7f0000` 分区余 `0x66afc0` 字节；链接期 DRAM 使用 74624 字节、余 49956 字节，IRAM 使用 103371 字节、余 27701 字节。两个 profile 都不预留 OTA 或文件系统；烧录前仍需核对板卡容量。Flash 增容不改变内部 DRAM/IRAM 或 PSRAM 运行时限制。
+Flash profile（ESP-IDF 5.5.3，2026-10-23）：实际 8 MB Rev 3.0/WROVER 配置镜像 `0x18ae70` 字节，`0x7f0000` app 分区余 `0x665190` 字节；链接期 DRAM 使用 86832 字节、余 37748，IRAM 使用 124971 字节、余 6101。干净 Classic-only 4 MB 无 PSRAM profile 镜像 `0x158870` 字节，`0x3f0000` app 分区余 `0x297790` 字节；DRAM 使用 71656 字节、余 52924，IRAM 使用 100167 字节、余 30905。清洁 CI profile 镜像 `0x13c260` 字节，DRAM 使用 71360 字节、余 53220，IRAM 使用 96023 字节、余 35049。2 MB 默认 app 分区不足；本项目的 `sdkconfig.defaults.4mb`/`partitions_4mb.csv` 与 `sdkconfig.defaults.8mb`/`partitions_8mb.csv` 分别配置 4 MB、8 MB 单应用分区。两个 profile 都不预留 OTA 或文件系统；烧录前仍需核对板卡容量。Flash 增容不改变内部 DRAM/IRAM 或 PSRAM 运行时限制。
 
 经典 ESP32 的 Bluetooth 与 Wi-Fi 共用 2.4 GHz 射频，ESP-IDF 通过共存调度共享资源。热点、蓝牙启动、CarPlay 媒体和浏览器 WebRTC 同时工作时，射频时隙、丢包、重传和画面延迟是主要风险。[ESP-IDF Wi-Fi/蓝牙共存](https://docs.espressif.com/projects/esp-idf/en/v5.0/esp32/api-guides/coexist.html)
 

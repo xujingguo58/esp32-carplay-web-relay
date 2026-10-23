@@ -122,9 +122,9 @@ typedef struct {
     } uuid;
 } esp_bt_uuid_t;
 typedef enum { ESP_BT_IO_CAP_NONE } esp_bt_io_cap_t;
-typedef enum { ESP_BT_CONNECTABLE, ESP_BT_NON_CONNECTABLE } esp_bt_connection_mode_t;
-typedef enum { ESP_BT_GENERAL_DISCOVERABLE, ESP_BT_LIMITED_DISCOVERABLE,
-               ESP_BT_NON_DISCOVERABLE } esp_bt_discovery_mode_t;
+typedef enum { ESP_BT_NON_CONNECTABLE, ESP_BT_CONNECTABLE } esp_bt_connection_mode_t;
+typedef enum { ESP_BT_NON_DISCOVERABLE, ESP_BT_LIMITED_DISCOVERABLE,
+               ESP_BT_GENERAL_DISCOVERABLE } esp_bt_discovery_mode_t;
 typedef enum { ESP_BT_PIN_TYPE_VARIABLE, ESP_BT_PIN_TYPE_FIXED } esp_bt_pin_type_t;
 typedef enum { ESP_BT_GAP_DISCOVERY_STOPPED, ESP_BT_GAP_DISCOVERY_STARTED }
     esp_bt_gap_discovery_state_t;
@@ -139,7 +139,8 @@ typedef struct {
 typedef enum { ESP_BT_GAP_DISC_RES_EVT, ESP_BT_GAP_DISC_STATE_CHANGED_EVT,
                ESP_BT_GAP_AUTH_CMPL_EVT, ESP_BT_GAP_PIN_REQ_EVT,
                ESP_BT_GAP_CFM_REQ_EVT, ESP_BT_GAP_KEY_NOTIF_EVT,
-               ESP_BT_GAP_KEY_REQ_EVT, ESP_BT_GAP_MODE_CHG_EVT }
+               ESP_BT_GAP_KEY_REQ_EVT, ESP_BT_GAP_MODE_CHG_EVT,
+               ESP_BT_GAP_CONFIG_EIR_DATA_EVT }
     esp_bt_gap_cb_event_t;
 typedef struct {
     union {
@@ -151,6 +152,7 @@ typedef struct {
         struct { esp_bd_addr_t bda; uint32_t passkey; } key_notif;
         struct { esp_bd_addr_t bda; } key_req;
         struct { int mode; } mode_chg;
+        struct { int stat; uint8_t eir_type_num; int eir_type[8]; } config_eir_data;
     };
 } esp_bt_gap_cb_param_t;
 typedef void (*esp_bt_gap_cb_t)(esp_bt_gap_cb_event_t, esp_bt_gap_cb_param_t *);
@@ -159,9 +161,42 @@ static inline esp_err_t esp_bt_gap_register_callback(esp_bt_gap_cb_t callback)
 typedef enum { ESP_BT_INQ_MODE_GENERAL_INQUIRY, ESP_BT_INQ_MODE_LIMITED_INQUIRY }
     esp_bt_inq_mode_t;
 #define ESP_BT_COD_MAJOR_DEV_PHONE 2U
+#define ESP_BT_COD_MAJOR_DEV_AV 4U
+#define ESP_BT_COD_SRVC_RENDERING 0x20U
+#define ESP_BT_COD_SRVC_AUDIO 0x100U
+#define ESP_BT_COD_SRVC_TELEPHONY 0x200U
+#define ESP_BT_EIR_FLAG_GEN_DISC 0x02U
 #define ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME 0x09U
 #define ESP_BT_EIR_TYPE_SHORT_LOCAL_NAME 0x08U
 #define ESP_BT_SP_IOCAP_MODE 0
+typedef struct {
+    uint32_t reserved_2 : 2;
+    uint32_t minor : 6;
+    uint32_t major : 5;
+    uint32_t service : 11;
+    uint32_t reserved_8 : 8;
+} esp_bt_cod_t;
+typedef enum { ESP_BT_SET_COD_MAJOR_MINOR, ESP_BT_SET_COD_SERVICE_CLASS,
+               ESP_BT_CLR_COD_SERVICE_CLASS, ESP_BT_SET_COD_ALL } esp_bt_cod_mode_t;
+typedef struct {
+    bool fec_required;
+    bool include_txpower;
+    bool include_uuid;
+    bool include_name;
+    uint8_t flag;
+    uint16_t manufacturer_len;
+    uint8_t *p_manufacturer_data;
+    uint16_t url_len;
+    uint8_t *p_url;
+} esp_bt_eir_data_t;
+static unsigned mock_scan_mode_call_count;
+static esp_bt_connection_mode_t mock_connection_mode;
+static esp_bt_discovery_mode_t mock_discovery_mode;
+static unsigned mock_cod_call_count;
+static esp_bt_cod_t mock_cod;
+static esp_bt_cod_mode_t mock_cod_mode;
+static unsigned mock_eir_call_count;
+static esp_bt_eir_data_t mock_eir_data;
 static inline esp_err_t esp_bt_gap_start_discovery(esp_bt_inq_mode_t mode,
                                                    uint8_t inq_len,
                                                    uint8_t num_responses)
@@ -187,7 +222,25 @@ static inline esp_err_t esp_bt_gap_set_device_name(const char *name)
 { (void)name; return ESP_OK; }
 static inline esp_err_t esp_bt_gap_set_scan_mode(esp_bt_connection_mode_t connection,
                                                  esp_bt_discovery_mode_t discovery)
-{ (void)connection; (void)discovery; return ESP_OK; }
+{
+    ++mock_scan_mode_call_count;
+    mock_connection_mode = connection;
+    mock_discovery_mode = discovery;
+    return ESP_OK;
+}
+static inline esp_err_t esp_bt_gap_set_cod(esp_bt_cod_t cod, esp_bt_cod_mode_t mode)
+{
+    ++mock_cod_call_count;
+    mock_cod = cod;
+    mock_cod_mode = mode;
+    return ESP_OK;
+}
+static inline esp_err_t esp_bt_gap_config_eir_data(esp_bt_eir_data_t *eir_data)
+{
+    ++mock_eir_call_count;
+    if (eir_data != NULL) mock_eir_data = *eir_data;
+    return ESP_OK;
+}
 
 #define ESP_UUID_LEN_128 16
 typedef struct {

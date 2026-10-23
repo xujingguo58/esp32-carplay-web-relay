@@ -47,7 +47,25 @@ int main(void)
     esp_spp_cb_param_t init = {0};
     init.init.status = ESP_SPP_SUCCESS;
     spp_callback(ESP_SPP_INIT_EVT, &init);
+    assert(mock_cod_call_count == 1U);
+    assert(mock_cod_mode == ESP_BT_SET_COD_ALL);
+    assert(mock_cod.major == ESP_BT_COD_MAJOR_DEV_AV);
+    assert(mock_cod.minor == BT_PORT_COD_MINOR_CAR_AUDIO);
+    assert(mock_cod.service == (ESP_BT_COD_SRVC_RENDERING |
+                                ESP_BT_COD_SRVC_AUDIO |
+                                ESP_BT_COD_SRVC_TELEPHONY));
+    assert(mock_eir_call_count == 1U);
+    assert(mock_eir_data.include_name);
+    assert(!mock_eir_data.include_uuid);
+    assert(mock_eir_data.flag == ESP_BT_EIR_FLAG_GEN_DISC);
+    assert(mock_scan_mode_call_count == 1U);
+    assert(mock_connection_mode == ESP_BT_NON_CONNECTABLE);
+    assert(mock_discovery_mode == ESP_BT_NON_DISCOVERABLE);
+
     bt_port_set_discovery_enabled(true);
+    assert(mock_scan_mode_call_count == 2U);
+    assert(mock_connection_mode == ESP_BT_CONNECTABLE);
+    assert(mock_discovery_mode == ESP_BT_GENERAL_DISCOVERABLE);
     simulate_open(42U);
     assert(bt_port_is_connected());
     (void)xQueueReset(s_rx_queue); /* Model the dispatcher consuming the OPEN event. */
@@ -78,6 +96,11 @@ int main(void)
     assert(disconnected.type == BT_RX_EVENT_STATE);
     assert(!disconnected.connected);
 
-    puts("bt_port host test passed (RX overflow disconnects and prioritizes state)");
+    bt_port_set_discovery_enabled(false);
+    assert(mock_scan_mode_call_count == 3U);
+    assert(mock_connection_mode == ESP_BT_NON_CONNECTABLE);
+    assert(mock_discovery_mode == ESP_BT_NON_DISCOVERABLE);
+
+    puts("bt_port host test passed (Car Audio identity gating and RX overflow cleanup)");
     return 0;
 }
